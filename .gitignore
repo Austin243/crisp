@@ -75,6 +75,7 @@ docs/*
 !docs/
 !docs/dependencies.md
 !docs/public-release.md
+!docs/2d-search.md
 
 # LaTeX / document build outputs
 docs/*.aux
