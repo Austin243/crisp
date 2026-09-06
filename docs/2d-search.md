@@ -1,7 +1,7 @@
 # 2D search foundations
 
-These are opt-in geometry and fingerprint foundations for a future 2D search
-mode. They do **not** enable 2D searches in `CRISPSearch`. Existing bulk search
+These are opt-in geometry, fingerprint, and generation foundations for a future
+2D search mode. They do **not** enable 2D searches in `CRISPSearch`. Existing bulk search
 behavior, imports, fingerprint code, relaxation, archives, and dependencies
 are unchanged.
 
@@ -17,7 +17,7 @@ are unchanged.
   external pressure is supported by this configuration.
 
 Bounds are explicit because they depend on the material. `initial_thickness`
-is intended for later candidate generation; it is not imposed on an existing
+controls candidate generation; it is not imposed on an existing
 structure. `max_thickness` and the minimum image gap bound prepared structures.
 Area bounds apply to the in-plane area divided by the number of atoms.
 
@@ -50,7 +50,8 @@ z boundary are not automatically repaired. A zero initial cell height is valid.
 `validate_slab` checks geometry without changing it; rigid z translations are
 allowed. These helpers do not establish 2D bonding/connectivity, minimum atomic
 separations, calculator compatibility, or safe fingerprint image clearance.
-Those checks and integration into the search pipeline belong to later PRs.
+The separate adapters below add distance and fingerprint clearance checks;
+connectivity, calculator checks, and search integration belong to later PRs.
 
 Run the focused tests with `python -m unittest discover -s tests -p test_slab.py`.
 They use the existing base dependencies and need no optional fingerprint backend.
@@ -107,3 +108,59 @@ list, check xyz forces and in-plane strain derivatives by finite differences,
 and verify vacuum/translation invariance, input preservation, and buffer limits.
 The normal lightweight suite still skips these backend audits when
 `torch_fplib` is absent; the geometry/clearance guard tests run either way.
+
+## Random slab candidates
+
+`generate_slabs` uses PyXtal's `dim=2` layer groups (1–80), with explicit
+composition, area per atom, and slab bounds. Install the existing optional
+dependency with `python -m pip install -e ".[search]"`. Generation has been
+verified with PyXtal 1.1.4; the existing bulk dependency requirements are unchanged.
+
+```python
+from crisp.slab_generation import generate_slabs
+
+candidates = generate_slabs(
+    {"C": 4}, config, n=2, seed=7, min_dist_ang=1.0,
+    layer_groups=[1, 2, 31, 80], max_attempts=40,
+)
+for candidate in candidates:
+    validate_slab(candidate, config)
+```
+
+The function returns exactly `n` ASE structures or raises a descriptive error.
+By default it samples from all composition-compatible layer groups. Species
+counts refer to the generated cell, with no primitive-cell reduction. Invalid
+arguments and incompatible group requests fail before generation. Failed
+generation or rejected candidates consume one attempt; exhaustion raises
+`RuntimeError` with the last rejection, without returning a partial batch or
+falling back to bulk generation. `max_attempts` defaults to `20*n` and bounds
+PyXtal calls, each of which also has bounded internal trials; it is not a time limit.
+
+In-plane area is sampled uniformly within the configured bounds, independently
+of vacuum. The cell metric follows the layer group: square or hexagonal where
+required, otherwise an aspect ratio from 0.5 to 2, with oblique angles from
+60 to 120 degrees where permitted. These are simple sampling choices, not
+chemistry-specific recommendations or an exhaustive cell-shape search.
+
+`initial_thickness` is the generation scale for z coordinates, **not** a bound
+on their final extent: symmetry operations can produce a larger span. Zero
+requests planar candidates. Raw symmetry-site coordinates are exported without
+wrapping z, then `prepare_slab` supplies vacuum and checks the actual thickness
+against `max_thickness`. A final mixed-PBC neighbor check enforces `min_dist_ang`
+for every species pair, including periodic copies of the same atom and contacts
+created by planar flattening. No connected-sheet or stability claim is made.
+
+An integer `seed` reproduces a batch with the same arguments and dependency
+versions, without consuming NumPy's legacy global RNG. A supplied NumPy
+`Generator` advances in place. Composition order and duplicate/order changes
+to `layer_groups` do not change results. `Atoms.info` records `origin="random"`,
+the generating `layer_group`, the per-attempt `generation_seed`, and
+`pyxtal_version`. The per-attempt seed alone does not encode the sampled cell;
+retain the full request and batch seed for reproduction. The group is generation
+provenance, not a subsequent symmetry classification.
+
+Run `python -c "import pyxtal"` before
+`python -m unittest discover -s tests -p test_slab_generation.py -v` for a full
+generation audit. Without PyXtal, the real generation tests skip and input
+validation tests still run. This module is separate from the bulk generator;
+relaxation, archive insertion, and `CRISPSearch` integration remain later work.
