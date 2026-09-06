@@ -1,8 +1,9 @@
 # 2D search foundations
 
-This is the geometry foundation for a future, opt-in 2D search mode. It does
-**not** enable 2D searches in `CRISPSearch`. Existing search behavior, imports,
-fingerprints, relaxation, archives, and dependencies are unchanged.
+These are opt-in geometry and fingerprint foundations for a future 2D search
+mode. They do **not** enable 2D searches in `CRISPSearch`. Existing bulk search
+behavior, imports, fingerprint code, relaxation, archives, and dependencies
+are unchanged.
 
 ## Geometry contract
 
@@ -53,3 +54,56 @@ Those checks and integration into the search pipeline belong to later PRs.
 
 Run the focused tests with `python -m unittest discover -s tests -p test_slab.py`.
 They use the existing base dependencies and need no optional fingerprint backend.
+
+## Slab fingerprints
+
+Use the separate `SlabFingerprintCalculator` for structures satisfying the
+geometry contract. It inherits the existing fingerprint mathematics and adds
+validation and normalization before each value or derivative calculation:
+
+```python
+from crisp.slab_fingerprint import SlabFingerprintCalculator
+
+fp_calc = SlabFingerprintCalculator(config, cutoff=3.2, natx=16, orbital="s")
+fp = fp_calc.get_fingerprints(slab)
+```
+
+The current `torch_fplib` backend searches periodic images along all three
+axes. This adapter requires the **actual** empty z gap to exceed the fingerprint
+cutoff by more than `1e-6` Angstrom. With the perpendicular cell required here,
+that excludes every z image from the local environment. The usual neighbor
+capacity check also applies; an undersized `natx` is rejected.
+
+Each call validates the input before wrapping xy and centering z on a copy.
+Invalid PBC, changed cell height, and insufficient image clearance are rejected
+instead of silently repaired. All five value/derivative entry points use the
+same preparation, and inherited distance methods use the guarded fingerprints.
+
+Both `s` and `sp` orbitals retain all Cartesian force components and all six
+Voigt strain/stress components. Stress remains in ASE's volume-normalized
+convention: compare `volume * stress` or in-plane `cell_height * stress` when
+changing vacuum, not raw stress. Freezing cell strain is a later relaxation
+concern. This descriptor does not establish bonding/connectivity, physical
+calculator compatibility, or a complete 2D search.
+
+### Reproduce the backend checks
+
+The slab tests were verified against unmodified `torch_fplib` commit
+[`6b622cf8156fd0a2cfd178d3a114307ec39fe687`](https://github.com/Rutgers-ZRG/torch_fplib/commit/6b622cf8156fd0a2cfd178d3a114307ec39fe687).
+Use a checkout of that revision on `PYTHONPATH` with CRISP's base dependencies
+installed; this does not change CRISP's package requirements. From the CRISP
+repository, using an unused temporary checkout path:
+
+```sh
+git clone https://github.com/Rutgers-ZRG/torch_fplib.git /tmp/crisp-torch-fplib
+git -C /tmp/crisp-torch-fplib checkout --detach 6b622cf8156fd0a2cfd178d3a114307ec39fe687
+PYTHONPATH=/tmp/crisp-torch-fplib python -c "import torch_fplib" && \
+PYTHONPATH=/tmp/crisp-torch-fplib python -m unittest discover -s tests -p test_slab_fingerprint.py -v
+```
+
+The import preflight prevents a missing backend from yielding a skipped audit.
+Tests compare `s`/`sp` fingerprints against an independent ASE mixed-PBC neighbor
+list, check xyz forces and in-plane strain derivatives by finite differences,
+and verify vacuum/translation invariance, input preservation, and buffer limits.
+The normal lightweight suite still skips these backend audits when
+`torch_fplib` is absent; the geometry/clearance guard tests run either way.
