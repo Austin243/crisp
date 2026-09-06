@@ -1,9 +1,9 @@
 # 2D search foundations
 
-These are opt-in geometry, fingerprint, and generation foundations for a future
-2D search mode. They do **not** enable 2D searches in `CRISPSearch`. Existing bulk search
-behavior, imports, fingerprint code, relaxation, archives, and dependencies
-are unchanged.
+These are opt-in geometry, fingerprint, generation, and atomic relaxation
+foundations for a future 2D search mode. They do **not** enable 2D searches in
+`CRISPSearch`. Existing bulk search behavior, imports, fingerprint code,
+relaxation, archives, and dependencies are unchanged.
 
 ## Geometry contract
 
@@ -83,8 +83,8 @@ same preparation, and inherited distance methods use the guarded fingerprints.
 Both `s` and `sp` orbitals retain all Cartesian force components and all six
 Voigt strain/stress components. Stress remains in ASE's volume-normalized
 convention: compare `volume * stress` or in-plane `cell_height * stress` when
-changing vacuum, not raw stress. Freezing cell strain is a later relaxation
-concern. This descriptor does not establish bonding/connectivity, physical
+changing vacuum, not raw stress. The slab quench below freezes the entire cell.
+This descriptor does not establish bonding/connectivity, physical
 calculator compatibility, or a complete 2D search.
 
 ### Reproduce the backend checks
@@ -162,5 +162,64 @@ provenance, not a subsequent symmetry classification.
 Run `python -c "import pyxtal"` before
 `python -m unittest discover -s tests -p test_slab_generation.py -v` for a full
 generation audit. Without PyXtal, the real generation tests skip and input
-validation tests still run. This module is separate from the bulk generator;
-relaxation, archive insertion, and `CRISPSearch` integration remain later work.
+validation tests still run. This module is separate from the bulk generator.
+Candidates can use the fixed-cell quench below; archive insertion and
+`CRISPSearch` integration remain later work.
+
+## Fixed-cell atomic quench
+
+`quench_slab` relaxes a valid slab copy with ASE's
+[`LBFGS`](https://docs.ase-lib.org/ase/optimize.html#ase.optimize.LBFGS), keeping
+the **entire cell** fixed. It allows every atom to move in x, y, and z, so a
+planar candidate can buckle. It introduces no z constraint or cell filter and
+requires only an ASE calculator's energy and forces, without requesting stress.
+Pass a factory that supplies a fresh calculator supporting physical mixed PBC.
+
+This small example uses ASE's EMT calculator to demonstrate the interface:
+
+```python
+from ase.calculators.emt import EMT
+from crisp.slab_relaxation import quench_slab
+
+quench_config = SlabConfig(
+    area_per_atom_range=(4.0, 20.0), initial_thickness=1.0,
+    max_thickness=4.0, cell_height=20.0, min_vacuum=12.0,
+)
+candidate = prepare_slab(
+    Atoms("Cu2", positions=[[0.0, 0.0, 0.0], [2.8, 0.3, 0.4]],
+          cell=[6.0, 6.0, 0.0]),
+    quench_config,
+)
+relaxed = quench_slab(candidate, quench_config, EMT, fmax=0.05, max_steps=200)
+energy_per_atom = relaxed.get_potential_energy() / len(relaxed)
+```
+
+The input must already satisfy `validate_slab` and have no ASE constraints;
+constraints are rejected rather than removed. The input's positions, cell,
+metadata, and attached calculator are preserved. The returned copy retains
+the fresh calculator and its final energy/forces. Coordinates are not wrapped
+or recentered during or after relaxation, so the results refer to exactly the
+returned geometry. The generating layer-group tag remains provenance, not a
+claim that relaxation preserves that symmetry.
+
+Success requires every atomic force norm to be below `fmax` (eV/Angstrom).
+`max_steps` bounds optimizer moves, not calculator calls or wall time. Zero
+evaluates the starting structure and succeeds only if already converged.
+The helper checks slab geometry before each evaluation and rejects nonfinite
+energy or forces. A bounded loop around `LBFGS.step()` gives consistent limits
+and validation order across ASE versions. It raises `ValueError` for invalid
+geometry/options/constraints and `RuntimeError` for invalid calculator results
+or an exhausted budget; calculator exceptions propagate. Failed runs never
+return a structure labeled as relaxed. Successful results record
+`slab_quench_steps` and `slab_quench_fmax` in `Atoms.info`.
+
+The slab configuration requires zero external pressure: energy per atom is the
+quantity available for later ranking, with no vacuum-dependent pressure-volume
+term. In-plane cell optimization, minimum-distance/connectivity checks after
+relaxation, material-specific energy checks, archive insertion, and search
+integration remain later work. A converged fixed-cell candidate is not yet a
+validated 2D material or a minimum with respect to in-plane strain.
+
+Run `python -m unittest discover -s tests -p test_slab_relaxation.py -v`.
+These tests need only the existing base dependencies, with no PyXtal or
+fingerprint backend required. They were verified with ASE 3.22.1 and 3.29.0.
