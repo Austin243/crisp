@@ -4,12 +4,13 @@ from collections import Counter
 from copy import deepcopy
 from dataclasses import asdict
 import logging
-from numbers import Integral
+from numbers import Integral, Real
 
 import numpy as np
 
 from .slab import _ATOL
 from .slab_archive import SlabArchive, _check_fields, _read_slab_json, _write_slab_json
+from .slab_cell_relaxation import SlabCellRelaxation
 from .slab_fingerprint import _IMAGE_MARGIN
 from .slab_generation import SlabGenerationError, generate_slabs
 from .slab_guidance import SlabGuidance, guide_slab
@@ -28,12 +29,13 @@ class SlabRandomSearch:
     """Generate, quench, validate and archive a fixed-composition 2D search.
 
     Start with an empty SlabArchive and a fresh-calculator factory supporting
-    mixed PBC. The entire sampled cell stays fixed during each atomic quench.
+    mixed PBC. The sampled cell stays fixed unless cell_relaxation is enabled;
+    that option relaxes the xy cell while retaining the perpendicular c vector.
     run(n_trials) requests that many additional trials, including rejections;
     each trial allows at most one quench. Optional screening ranks candidate
     pools with ExactGP. Optional mutations perturb archived parents between
     random trials. Optional fingerprint guidance precedes the unbiased physical
-    quench; neither stage relaxes the cell.
+    quench. Guidance always holds the entire cell fixed.
 
     calculator_id is a caller-supplied energy-model label, checked on resume;
     the caller must also supply the same actual model and dependency versions.
@@ -45,11 +47,14 @@ class SlabRandomSearch:
                  fmax: float = 0.05, max_steps: int = 200,
                  screening: SlabGPScreening | None = None,
                  mutations: SlabMutations | None = None,
-                 guidance: SlabGuidance | None = None):
+                 guidance: SlabGuidance | None = None,
+                 cell_relaxation: SlabCellRelaxation | None = None):
         if screening is not None and not isinstance(screening, SlabGPScreening):
             raise TypeError("screening must be SlabGPScreening or None")
         if mutations is not None and not isinstance(mutations, SlabMutations):
             raise TypeError("mutations must be SlabMutations or None")
+        if cell_relaxation is not None and not isinstance(cell_relaxation, SlabCellRelaxation):
+            raise TypeError("cell_relaxation must be SlabCellRelaxation or None")
         if guidance is not None:
             if not isinstance(guidance, SlabGuidance):
                 raise TypeError("guidance must be SlabGuidance or None")
@@ -83,6 +88,7 @@ class SlabRandomSearch:
         self._screening = screening
         self._mutations = mutations
         self._guidance = guidance
+        self._cell_relaxation = cell_relaxation
         self._archive_settings = archive_settings
         self._settings = dict(calculator_id=calculator_id, seed=int(seed),
                               layer_groups=sorted(set(int(g) for g in groups)),
@@ -94,6 +100,8 @@ class SlabRandomSearch:
             self._settings["mutations"] = asdict(mutations)
         if guidance is not None:
             self._settings["guidance"] = asdict(guidance)
+        if cell_relaxation is not None:
+            self._settings["cell_relaxation"] = asdict(cell_relaxation)
 
     @property
     def completed_trials(self):
@@ -149,6 +157,8 @@ class SlabRandomSearch:
             outcome["proposal"] = None
         if self._guidance is not None:
             outcome["guidance"] = None
+        if self._cell_relaxation is not None:
+            outcome["stress_max"] = None
         feature = None
         if self._screening is None:
             try:
@@ -172,9 +182,12 @@ class SlabRandomSearch:
                 # Train on the actual input to the unbiased physical quench.
                 feature = candidate_features(candidate, self.archive.fp_calc)
             outcome["guidance"] = dict(mode=mode, **guided)
+        quench_options = dict(fmax=options["fmax"], max_steps=options["max_steps"])
+        if self._cell_relaxation is not None:
+            quench_options["cell_relaxation"] = self._cell_relaxation
         try:
             relaxed = quench_slab(candidate, config, self.calc_factory,
-                                  fmax=options["fmax"], max_steps=options["max_steps"])
+                                  **quench_options)
         except (SlabQuenchBoundsError, SlabQuenchNotConverged) as exc:
             return outcome | dict(status="quench_rejected", reason=str(exc))
         total_energy = relaxed.get_potential_energy()
@@ -184,6 +197,12 @@ class SlabRandomSearch:
         energy = float(total_energy / len(relaxed))
         if not np.isfinite(energy):
             raise RuntimeError("Slab energy per atom must be finite")
+        if self._cell_relaxation is not None:
+            stress = relaxed.info.get("slab_quench_stress_max")
+            if (isinstance(stress, bool) or not isinstance(stress, Real) or not np.isfinite(stress)
+                    or not 0 <= stress < self._cell_relaxation.stress_max):
+                raise RuntimeError("Slab cell quench must return a converged finite 2D stress")
+            outcome["stress_max"] = float(stress)
         outcome.update(energy_per_atom=energy, quench_steps=relaxed.info["slab_quench_steps"])
         try:
             validate_slab_candidate(relaxed, config, min_dist_ang=self.archive.min_dist_ang,
@@ -285,6 +304,8 @@ class SlabRandomSearch:
             metadata["proposal"] = deepcopy(outcome["proposal"])
         if self._guidance is not None:
             metadata["guidance"] = deepcopy(outcome["guidance"])
+        if self._cell_relaxation is not None:
+            metadata["stress_max"] = outcome["stress_max"]
         return metadata
 
     def save(self, path):
@@ -299,6 +320,8 @@ class SlabRandomSearch:
             payload["version"] = 3
         if self._guidance is not None:
             payload["version"] = 4
+        if self._cell_relaxation is not None:
+            payload["version"] = 5
         _write_slab_json(path, payload)
 
     def load(self, path):
@@ -314,6 +337,8 @@ class SlabRandomSearch:
             version = 3
         if self._guidance is not None:
             version = 4
+        if self._cell_relaxation is not None:
+            version = 5
         if (payload["format"] != "crisp-slab-search"
                 or type(payload["version"]) is not int or payload["version"] != version):
             raise ValueError("Unsupported slab search checkpoint format/version")
@@ -332,6 +357,8 @@ class SlabRandomSearch:
                 fields.add("proposal")
             if self._guidance is not None:
                 fields.add("guidance")
+            if self._cell_relaxation is not None:
+                fields.add("stress_max")
             _check_fields(outcome, fields)
             if (type(outcome["trial"]) is not int or outcome["trial"] != index + 1
                     or type(outcome["seed"]) is not int or outcome["seed"] != self._trial_seed(index)
@@ -351,6 +378,14 @@ class SlabRandomSearch:
                     raise ValueError("Slab search quench exceeds its step budget")
             elif outcome["energy_per_atom"] is not None or outcome["quench_steps"] is not None:
                 raise ValueError("Unrelaxed trial cannot contain quench results")
+            if self._cell_relaxation is not None:
+                stress = outcome["stress_max"]
+                if outcome["status"] in _RELAXED:
+                    if (type(stress) not in (int, float) or not np.isfinite(stress)
+                            or not 0 <= stress < self._cell_relaxation.stress_max):
+                        raise ValueError("Invalid or unconverged slab search 2D stress")
+                elif stress is not None:
+                    raise ValueError("Unrelaxed trial cannot contain a 2D stress result")
             if self._screening is not None:
                 self._validate_screening(outcome, index, n_training)
                 n_training += outcome["status"] in ("accepted", "duplicate")
@@ -367,6 +402,11 @@ class SlabRandomSearch:
                 entry.metadata != self._entry_metadata(outcome) or entry.energy != outcome["energy_per_atom"]
                 for entry, outcome in zip(target.entries, accepted)):
             raise ValueError("Slab search archive does not match its accepted trials")
+        if self._cell_relaxation is not None and any(
+                type(entry.atoms.info.get("slab_quench_stress_max")) not in (int, float)
+                or entry.atoms.info["slab_quench_stress_max"] != outcome["stress_max"]
+                for entry, outcome in zip(target.entries, accepted)):
+            raise ValueError("Slab cell quench info does not match its accepted stress")
         self.archive.entries = target.entries
         self.outcomes = deepcopy(outcomes)
         self.training_rows = training

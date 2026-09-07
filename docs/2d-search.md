@@ -2,11 +2,12 @@
 
 `SlabRandomSearch` provides an opt-in, automated 2D search using
 the slab geometry, fingerprints, generation, atomic quench, validation, and archive
-components below. It samples in-plane cells and relaxes atoms with each cell fixed.
+components below. It samples in-plane cells and relaxes atoms, optionally
+optimizing the in-plane lattice while keeping the perpendicular c vector fixed.
 Random search is the default. Optional mutations, GP screening and
 fingerprint-guided atomic moves propose candidates before an unbiased physical
-quench. This does **not** add a 2D mode to `CRISPSearch` or in-plane lattice
-relaxation. Original bulk modules and package requirements are unchanged.
+quench. This does **not** add a 2D mode to the original `CRISPSearch` class.
+Original bulk modules and package requirements are unchanged.
 
 ## Geometry contract
 
@@ -172,7 +173,7 @@ Candidates can use the fixed-cell quench and slab archive below;
 
 ## Fixed-cell atomic quench
 
-`quench_slab` relaxes a valid slab copy with ASE's
+By default, `quench_slab` relaxes a valid slab copy with ASE's
 [`LBFGS`](https://docs.ase-lib.org/ase/optimize.html#ase.optimize.LBFGS), keeping
 the **entire cell** fixed. It allows every atom to move in x, y, and z, so a
 planar candidate can buckle. It introduces no z constraint or cell filter and
@@ -220,8 +221,9 @@ return a structure labeled as relaxed. Successful results record
 The slab configuration requires zero external pressure: energy per atom is the
 quantity used for ranking, with no vacuum-dependent pressure-volume
 term. Use the candidate validator below to check distances and connectivity after
-relaxation. In-plane cell optimization, material-specific energy checks,
-and integration with the full CRISP algorithm remain later work. A converged fixed-cell
+relaxation. Opt-in in-plane cell optimization is described below; material-specific
+validation and integration with the original `CRISPSearch` class remain separate.
+A converged fixed-cell
 candidate is not yet a validated 2D material or a minimum with respect to in-plane
 strain.
 
@@ -515,7 +517,7 @@ or recovery of the ground state of an unknown material.
 ## GP candidate screening
 
 Pass `screening=SlabGPScreening()` to opt in to GP candidate selection. Omitting
-it, with mutations and guidance also disabled, preserves PR #8's candidate stream, outcomes,
+it, with mutations, guidance and cell relaxation also disabled, preserves PR #8's candidate stream, outcomes,
 and version-1 checkpoints.
 The existing `ExactGP` implementation and original CRISP modules are unchanged.
 
@@ -576,7 +578,7 @@ and nonfinite scores propagate before quench; no silent random fallback is used.
 
 ### GP checkpoints and example
 
-Screening-enabled searches without mutations or guidance use **version-2** search checkpoints containing the
+Screening-enabled searches without mutations, guidance or cell relaxation use **version-2** search checkpoints containing the
 same archive/progress information plus screening settings and the bounded raw
 training rows. The live GP object and inverse matrices are not serialized;
 deterministic retraining reconstructs them from saved data. Loading checks row
@@ -694,10 +696,10 @@ Each mutation candidate has at most `max_attempts` proposals. Exhaustion raises
 trial if no pool member succeeds. It does not silently switch to random generation.
 Invalid options/parents and unexpected errors propagate. Mutations do not evaluate
 energies or fingerprints. Connectivity is checked after the existing unbiased
-physical quench, just as for randomly generated candidates. Each quench keeps
-the entire proposed cell fixed; changing a cell proposal does not optimize it.
+physical quench, just as for randomly generated candidates. By default each quench
+keeps the entire proposed cell fixed; a cell mutation alone does not optimize it.
 
-Mutation-enabled searches without guidance use **version-3** checkpoints, with GP training rows
+Mutation-enabled searches without guidance or cell relaxation use **version-3** checkpoints, with GP training rows
 only when screening is enabled. Outcomes and accepted archive metadata contain
 `proposal={"source": "random" | "mutation", "parent_trial": ...}`; the parent is
 an earlier accepted trial, or `None` for random candidates. Failed generation has
@@ -791,7 +793,7 @@ duplicate detection and final force convergence continue to use the physical
 calculator alone. Strictly lowering the GP score does not guarantee lower
 physical energy, a faster search, or recovery of a stable material.
 
-Guidance-enabled searches use **version-4** checkpoints. Each selected outcome
+Guidance-enabled searches without cell relaxation use **version-4** checkpoints. Each selected outcome
 records guidance mode, accepted steps, attempted steps, initial/final acquisition
 scores, and stopping reason (`flat`, `blocked`, or `budget`); bypassed modes have
 zero steps and no scores, and failed generation has no guidance record. Accepted
@@ -826,20 +828,121 @@ increased from 42 to 113 and 124, respectively, plus 18 and 30 force projections
 **This small comparison shows no efficiency improvement.** It verifies the
 mechanics and extra computational cost, not material recovery.
 
+## In-plane physical cell relaxation
+
+Pass `cell_relaxation=SlabCellRelaxation()` to `quench_slab` or `SlabRandomSearch`
+to optimize atomic xyz coordinates together with both in-plane cell vectors and
+shear. The perpendicular c vector and physical PBC `(True, True, False)` stay
+fixed. The default `None` retains fixed-cell relaxation without requesting stress.
+This option works independently or with GP screening, mutations and guidance;
+guidance itself continues to hold the cell fixed before the physical quench.
+
+```python
+from crisp.slab_cell_relaxation import SlabCellRelaxation
+
+cell_archive = SlabArchive(
+    SlabFingerprintCalculator(search_config, cutoff=3.2, natx=32), {"Cu": 4},
+    min_dist_ang=1.5,
+)
+cell_search = SlabRandomSearch(
+    cell_archive, EMT, calculator_id="ASE-EMT-default", seed=23,
+    layer_groups=[1, 2, 80], max_generation_attempts=6, fmax=0.05, max_steps=200,
+    cell_relaxation=SlabCellRelaxation(stress_max=0.01),
+)
+cell_search.run(8, checkpoint="slab-cell-search.json")
+```
+
+The calculator must provide finite real energy, forces and ASE stress, support
+mixed PBC, and be valid for the target material. Stress must use ASE's
+**volume-normalized eV/Angstrom³** convention. Missing or malformed stress is a
+fatal calculator error; there is no silent fallback to fixed-cell relaxation.
+Only physical energy per atom ranks candidates; zero external pressure adds no
+pressure-volume or bias energy term.
+
+Convergence requires **both** of the following at the same geometry:
+
+- Maximum physical per-atom force norm below `fmax`, in eV/Angstrom.
+- `c * max(abs(stress[xx, yy, xy])) < stress_max`, in eV/Angstrom².
+
+`stress_max` defaults to 0.01 eV/Angstrom². Multiplying the raw calculator stress
+by c removes the arbitrary vacuum normalization: increasing the vacuum alone
+must not make an unconverged sheet pass. The zz, xz and yz stresses do not drive
+cell motion or enter this criterion. They must still be finite. Forces in z
+remain active, allowing buckling and thickness changes within the slab bounds.
+Choose force/stress tolerances and geometry bounds appropriate to the material.
+
+A small adapter uses ASE's energy-consistent `UnitCellFilter` with only the xy
+deformation block free. It enforces that restriction on proposed coordinates as
+well as forces, including on ASE 3.22. The filter uses atom-count scaling, which
+is independent of vacuum. Convergence uses raw Cartesian forces and raw physical
+stress, rather than the filter's transformed generalized forces/stress.
+
+The existing `max_steps` now bounds joint atomic/cell optimizer moves. A zero-step
+request evaluates both criteria without moving. Geometry is checked before every
+new calculation; crossing area or thickness bounds rejects the quench before
+another evaluation. Bounds are not clipped, and a bound-constrained stationary
+point with nonzero in-plane stress is not reported as converged. Distances and
+2D connectivity are still checked after quench and before archive insertion.
+
+The input and its calculator remain untouched. On the owned copy, only tolerated
+cell roundoff is first canonicalized: the four off-plane components become zero
+and c becomes `(0, 0, config.cell_height)`, without scaling positions. Coordinates
+are not wrapped or centered during relaxation. Successful cell quenches retain
+the physical calculator and record `slab_quench_stress_max` alongside the existing
+step count and final atomic force norm in `Atoms.info`.
+
+Cell-enabled searches use **version-5** checkpoints, with or without the other
+options. Completed quench outcomes store `stress_max`, the final measured 2D
+stress, including structurally rejected or duplicate outcomes. Generation and
+quench rejections store `None`. Accepted archive metadata retains this value;
+loading validates the threshold, settings and agreement with quench info before
+replacing live state. GP training still pairs the actual physical-quench input
+descriptor with its final physical energy, now after joint atomic/cell relaxation.
+Earlier checkpoints cannot switch quench modes on reload; disabled cell mode
+continues to read/write the prior v1–v4 formats unchanged.
+
+```sh
+python examples/slab_random_search.py --relax-cell --trials 3 --checkpoint cu-cell.json
+python examples/slab_random_search.py --relax-cell --resume --trials 5 --checkpoint cu-cell.json
+```
+
+Add `--gp --mutations --guidance` to both commands to combine all options. These
+are mechanics examples, not evidence that a copper monolayer is stable. Run
+`python -m unittest discover -s tests -p 'test_slab_cell*.py' -v` for cell checks.
+
+With ASE 3.29 and 3.22, generalized atomic/cell forces matched central energy
+differences at a nonidentity, sheared Cu4/EMT geometry within `5e-7`. A distorted
+Cu4 sheet relaxed with c=18 and 36 Angstrom took the same 21 moves; final cell
+and coordinate differences were below `7e-15` Angstrom, with equal energies and
+2D stresses to roundoff. These checks test the in-plane derivative convention
+and vacuum normalization independently of the search driver.
+
+In an eight-trial seed-23 run with the example geometry and `natx=64`, cell
+relaxation retained one slab, identified four duplicates and rejected three
+quenches at geometry bounds. The first candidate's area per atom changed from
+4.861780 to 5.378008 Angstrom² and energy from 0.845710 to 0.744904 eV/atom in
+four moves, with final 2D stress 0.000439 eV/Angstrom². A combined run using
+GP pool=3, minimum training=2, exploration every 4, recent window=4 and default
+mutation/guidance settings also exercised all stages successfully. Both 3+5
+restarts reproduced outcomes and training exactly; archive coordinate differences
+were below `5e-16` Angstrom. This demonstrates relaxation and restart mechanics,
+not recovery or stability of a target material. Disabled cell mode also matched
+the actual PR #11 driver's six-trial v1–v4 checkpoint payloads byte for byte.
+
 ## Remaining PRs
 
 PR #8 provides functioning **fixed-cell random search over sampled 2D cells**;
 PR #9 adds optional GP selection, PR #10 adds bounded mutations with random
-injection, and PR #11 adds fingerprint-guided proposals before unbiased quenching.
+injection, PR #11 adds fingerprint-guided proposals before unbiased quenching,
+and PR #12 adds in-plane physical cell relaxation at fixed c.
 The next small PRs should preserve bulk defaults:
 
 | PR | Scope | Acceptance milestone |
 | --- | --- | --- |
-| 12 | Relax a/b and in-plane shear while keeping c and out-of-plane tilt fixed. | Verify in-plane derivatives/stress and results under changes in vacuum. |
 | 13 | Add target-material recovery benchmarks and documented operating settings. | Recover reference sheets across seeds, converge budgets, validate the energy model and compare with trusted relaxation results. |
 
-The driver now supports optional GP selection and fingerprint-guided movement;
-after #12 it can optimize in-plane lattice parameters. Readiness for
+The driver now supports optional GP selection, fingerprint-guided movement
+and in-plane lattice optimization. Readiness for
 scientific predictions requires the material-specific evidence in #13, not only
 a completed PR count. HPC execution and more advanced finishers can follow.
 
