@@ -11,6 +11,7 @@ from ase.calculators.emt import EMT
 
 from crisp.slab import SlabConfig
 from crisp.slab_archive import SlabArchive
+from crisp.slab_cell_relaxation import SlabCellRelaxation
 from crisp.slab_fingerprint import SlabFingerprintCalculator
 from crisp.slab_guidance import SlabGuidance
 from crisp.slab_mutation import SlabMutations
@@ -27,6 +28,7 @@ def main():
     parser.add_argument("--gp", action="store_true", help="enable GP screening after random bootstrap")
     parser.add_argument("--mutations", action="store_true", help="perturb archived parents between random trials")
     parser.add_argument("--guidance", action="store_true", help="move atoms along the GP acquisition gradient; requires --gp")
+    parser.add_argument("--relax-cell", action="store_true", help="relax the in-plane cell at fixed c; requires calculator stress")
     args = parser.parse_args()
     if args.trials < 0 or args.seed < 0:
         parser.error("trials and seed must be nonnegative")
@@ -49,6 +51,7 @@ def main():
         screening=SlabGPScreening() if args.gp else None,
         mutations=SlabMutations() if args.mutations else None,
         guidance=SlabGuidance() if args.guidance else None,
+        cell_relaxation=SlabCellRelaxation() if args.relax_cell else None,
     )
     if args.resume:
         search.load(args.checkpoint)
