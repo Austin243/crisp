@@ -5,7 +5,7 @@ editing the upstream bulk implementation. It uses the layered candidates from
 [PR13](2d-layers.md) and [native VASP backend](2d-native-vasp.md). The earlier
 `SlabRandomSearch` remains available with its original behavior and checkpoints.
 
-**Draft validation status:** controller tests exercise real GP, geometry,
+**Experimental validation status:** controller tests exercise real GP, geometry,
 archive and mutation code with synthetic native results. They do not establish
 VASP compatibility, target-material recovery or search efficiency. Actual
 supported-build native relaxations and a small unseeded reference search remain
