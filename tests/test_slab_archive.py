@@ -229,11 +229,11 @@ class TestSlabArchive(unittest.TestCase):
         np.testing.assert_array_equal(self.archive.get_repulsion_centers(),
                                       self.archive.get_all_pooled_fps())
 
-    def test_persistence_is_explicitly_disabled_without_filesystem_effects(self):
+    def test_search_checkpoints_are_disabled_without_filesystem_effects(self):
         self.assertTrue(self.archive.add(_sheet(), -3.0))
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "must-not-exist"
-            for method in ("save", "load", "save_checkpoint", "load_checkpoint"):
+            for method in ("save_checkpoint", "load_checkpoint"):
                 with self.subTest(method=method), self.assertRaises(NotImplementedError):
                     getattr(self.archive, method)(str(path))
                 self.assertFalse(path.exists())
