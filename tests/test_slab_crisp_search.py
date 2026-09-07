@@ -7,6 +7,7 @@ test double: these tests neither launch VASP nor establish DFT correctness.
 from copy import deepcopy
 from dataclasses import replace
 import io
+import json
 from contextlib import redirect_stdout
 from pathlib import Path
 import random
@@ -18,6 +19,7 @@ import numpy as np
 from ase import Atoms
 
 from crisp.slab import SlabConfig
+from crisp.slab_archive import _write_slab_json
 from crisp.slab_crisp_search import SlabCRISPSearch
 from crisp.slab_fingerprint import SlabFingerprintCalculator
 from crisp.slab_generation import SlabGenerationError
@@ -245,6 +247,32 @@ class TestSlabCRISPSearch(unittest.TestCase):
             np.testing.assert_array_equal(replayed.positions, expected.positions)
             np.testing.assert_array_equal(replayed.cell, expected.cell)
 
+    def test_failed_checkpoint_write_rolls_back_and_reuses_completed_mutants(self):
+        backend = _NativeResults(self.spec)
+        search = self.make_search(backend, n_random=2, n_mutants=4)
+        self.run_seeded(search, 1, checkpoint=self.path)
+        previous = self.make_search(n_random=2, n_mutants=4)
+        previous.load(self.path)
+        saved = self.path.read_bytes()
+
+        def fail_new_generation(path, payload):
+            if payload["next_generation"] == 2:
+                raise OSError("simulated checkpoint write failure")
+            return _write_slab_json(path, payload)
+
+        with patch("crisp.slab_crisp_search._write_slab_json", side_effect=fail_new_generation), \
+                self.assertRaisesRegex(OSError, "checkpoint write failure"):
+            self.run_seeded(search, 1, checkpoint=self.path)
+        self.assert_same_search(previous, search)
+        self.assertEqual(self.path.read_bytes(), saved)
+        self.assertEqual(len(backend.cache), 8)
+        self.run_seeded(search, 1, checkpoint=self.path)
+        self.assertEqual(len(backend.cache), 8)
+        self.assertEqual(search.n_relaxed, 8)
+        uninterrupted = self.make_search(n_random=2, n_mutants=4)
+        self.run_seeded(uninterrupted, 2)
+        self.assert_same_search(uninterrupted, search)
+
     def test_split_population_search_matches_full_run_in_both_screening_modes(self):
         for mode in ("filter", "rank"):
             with self.subTest(mode=mode):
@@ -308,6 +336,38 @@ class TestSlabCRISPSearch(unittest.TestCase):
         backend.settings["final_recipe"] = "different-toy-energy-model"
         with self.assertRaises(ValueError):
             self.make_search(backend).load(self.path)
+
+    def test_checkpoint_archive_candidate_ids_must_map_one_to_one_to_accepted_results(self):
+        backend = _NativeResults(self.spec)
+        native_relax = backend.relax
+
+        def equal_energy_result(atoms, candidate_id):
+            result = native_relax(atoms, candidate_id)
+            result.energy_per_atom = -10.0
+            return result
+
+        source = self.make_search(backend, n_random=2, n_mutants=0)
+        with patch.object(backend, "relax", side_effect=equal_energy_result):
+            self.run_seeded(source, 1, checkpoint=self.path)
+        payload = json.loads(self.path.read_text())
+        entries = payload["archive"]["entries"]
+        self.assertEqual(len(entries), 2)
+        self.assertNotEqual(entries[0]["metadata"]["candidate_id"],
+                            entries[1]["metadata"]["candidate_id"])
+        # Preserve both valid structures and their equal energies; corrupt only
+        # the mapping from the second structure to its native calculation ID.
+        entries[1]["metadata"]["candidate_id"] = entries[0]["metadata"]["candidate_id"]
+        self.path.write_text(json.dumps(payload))
+        target = self.make_search(n_random=2, n_mutants=0)
+        self.run_seeded(target, 1)
+        archive_entries, outcomes, gp = target.archive.entries, target.outcomes, target.gp
+        previous_outcomes = deepcopy(outcomes)
+        with self.assertRaises(ValueError):
+            target.load(self.path)
+        self.assertIs(target.archive.entries, archive_entries)
+        self.assertIs(target.outcomes, outcomes)
+        self.assertIs(target.gp, gp)
+        self.assertEqual(target.outcomes, previous_outcomes)
 
     def test_unsupported_bulk_operators_are_not_silently_enabled(self):
         for options in ({"enable_flow": True}, {"enable_fp_finisher": True},

@@ -374,6 +374,11 @@ class SlabCRISPSearch(CRISPSearch):
                 raise ValueError("Invalid checkpoint rejection")
         if len(accepted) != len(target.entries):
             raise ValueError("Checkpoint archive/outcomes disagree")
+        archive_ids = [entry.metadata.get("candidate_id") for entry in target.entries]
+        if (any(not isinstance(ident, str) for ident in archive_ids)
+                or len(set(archive_ids)) != len(archive_ids)
+                or set(archive_ids) != set(accepted)):
+            raise ValueError("Checkpoint archive candidate identities must match accepted outcomes exactly")
         for entry in target.entries:
             record = accepted.get(entry.metadata.get("candidate_id"))
             if (record is None or record["generation"] != entry.generation
