@@ -9,6 +9,14 @@ from ase.optimize import LBFGS
 from .slab import SlabConfig, validate_slab
 
 
+class SlabQuenchBoundsError(ValueError):
+    """An optimizer move left the allowed slab geometry."""
+
+
+class SlabQuenchNotConverged(RuntimeError):
+    """The bounded atomic relaxation did not reach its force threshold."""
+
+
 def quench_slab(atoms: Atoms, config: SlabConfig, calc_factory, *,
                 fmax: float = 0.05, max_steps: int = 200) -> Atoms:
     """Return a valid, converged copy with a fresh ASE calculator attached.
@@ -45,15 +53,18 @@ def quench_slab(atoms: Atoms, config: SlabConfig, calc_factory, *,
     # ASE versions differ in irun's evaluation order and handling of steps=0.
     with LBFGS(relaxed, logfile=None) as optimizer:
         for steps in range(max_steps + 1):
-            validate_slab(relaxed, config)
+            try:
+                validate_slab(relaxed, config)
+            except ValueError as exc:
+                raise SlabQuenchBoundsError(str(exc)) from exc
             if not np.array_equal(relaxed.cell.array, cell):
                 raise ValueError("Slab cell changed during fixed-cell quench")
             energy = relaxed.get_potential_energy()
             forces = relaxed.get_forces()
-            if (np.ndim(energy) != 0 or not np.isfinite(energy)
+            if (np.ndim(energy) != 0 or np.iscomplexobj(energy) or not np.isfinite(energy)
                     or forces.shape != (len(relaxed), 3)
-                    or not np.isfinite(forces).all()):
-                raise RuntimeError("Slab calculator must return finite energy and (N, 3) forces")
+                    or np.iscomplexobj(forces) or not np.isfinite(forces).all()):
+                raise RuntimeError("Slab calculator must return finite real energy and (N, 3) forces")
             max_force = float(np.linalg.norm(forces, axis=1).max())
             if not np.isfinite(max_force):
                 raise RuntimeError("Slab calculator returned a nonfinite force norm")
@@ -63,6 +74,6 @@ def quench_slab(atoms: Atoms, config: SlabConfig, calc_factory, *,
             if steps < max_steps:
                 optimizer.step()
 
-    raise RuntimeError(
+    raise SlabQuenchNotConverged(
         f"Slab quench did not converge after {max_steps} steps: "
         f"max force {max_force:.6g} eV/Angstrom >= fmax {fmax:.6g}")

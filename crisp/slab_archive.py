@@ -146,6 +146,10 @@ class SlabArchive(StructureArchive):
         Metadata and Atoms.info must contain finite JSON values with string keys;
         tuples become lists. Ordinary ASE arrays and constraints are preserved.
         """
+        _write_slab_json(path, self._to_payload())
+
+    def _to_payload(self):
+        """Share the archive format with the opt-in search checkpoint."""
         _, settings = self._persistence_target()
         records = []
         for entry in self.entries:
@@ -158,24 +162,7 @@ class SlabArchive(StructureArchive):
                 raise TypeError("Slab archive atom arrays must be numeric, boolean or Unicode")
             records.append(dict(atoms=atoms, info=info, energy_per_atom=entry.energy,
                                 metadata=entry.metadata, generation=entry.generation))
-        payload = json.dumps(dict(format="crisp-slab-archive", version=1,
-                                  settings=settings, entries=records),
-                             default=_slab_json_default, allow_nan=False, indent=2)
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = None
-        try:
-            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
-                                             prefix=f".{path.name}.", suffix=".tmp",
-                                             delete=False) as stream:
-                temporary = Path(stream.name)
-                stream.write(payload + "\n")
-                stream.flush()
-                os.fsync(stream.fileno())
-            temporary.replace(path)
-        finally:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
+        return dict(format="crisp-slab-archive", version=1, settings=settings, entries=records)
 
     def load(self, path: str | Path) -> None:
         """Replace entries only after a compatible file fully validates.
@@ -184,10 +171,11 @@ class SlabArchive(StructureArchive):
         Invalid or duplicate records and backend errors leave this archive intact.
         This restores archive contents, not calculator, GP, RNG, or search state.
         """
+        self._load_payload(_read_slab_json(path))
+
+    def _load_payload(self, payload):
+        """Validate an archive payload before replacing any existing entries."""
         target, settings = self._persistence_target()
-        payload = json.loads(Path(path).read_text(encoding="utf-8"),
-                             parse_constant=_invalid_json_constant,
-                             object_pairs_hook=_unique_json_fields)
         _check_fields(payload, {"format", "version", "settings", "entries"})
         if (payload["format"] != "crisp-slab-archive"
                 or type(payload["version"]) is not int or payload["version"] != 1):
@@ -228,6 +216,30 @@ class SlabArchive(StructureArchive):
         raise NotImplementedError("Slab search checkpoints require a separate GP/RNG/search-state contract")
 
     save_checkpoint = load_checkpoint = _unsupported_checkpoint
+
+
+def _read_slab_json(path):
+    return json.loads(Path(path).read_text(encoding="utf-8"),
+                      parse_constant=_invalid_json_constant, object_pairs_hook=_unique_json_fields)
+
+
+def _write_slab_json(path, payload):
+    payload = json.dumps(payload, default=_slab_json_default, allow_nan=False, indent=2)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=f".{path.name}.", suffix=".tmp",
+                                         delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(payload + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def _check_json_value(value):
