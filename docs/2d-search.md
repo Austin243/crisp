@@ -1,9 +1,9 @@
 # 2D search foundations
 
 These opt-in helpers cover geometry, fingerprints, generation, atomic relaxation,
-and structural validation for a future 2D search mode. They do **not** enable 2D
-searches in `CRISPSearch`. Existing bulk search behavior, imports, fingerprint
-code, relaxation, archives, and dependencies are unchanged.
+structural validation, and an in-memory archive for a future 2D search mode.
+They do **not** enable 2D searches in `CRISPSearch`. Existing bulk search behavior,
+imports, fingerprint code, relaxation, archives, and dependencies are unchanged.
 
 ## Geometry contract
 
@@ -163,8 +163,8 @@ Run `python -c "import pyxtal"` before
 `python -m unittest discover -s tests -p test_slab_generation.py -v` for a full
 generation audit. Without PyXtal, the real generation tests skip and input
 validation tests still run. This module is separate from the bulk generator.
-Candidates can use the fixed-cell quench below; archive insertion and
-`CRISPSearch` integration remain later work.
+Candidates can use the fixed-cell quench and slab archive below;
+`CRISPSearch` integration remains later work.
 
 ## Fixed-cell atomic quench
 
@@ -216,8 +216,8 @@ return a structure labeled as relaxed. Successful results record
 The slab configuration requires zero external pressure: energy per atom is the
 quantity available for later ranking, with no vacuum-dependent pressure-volume
 term. Use the candidate validator below to check distances and connectivity after
-relaxation. In-plane cell optimization, material-specific energy checks, archive
-insertion, and search integration remain later work. A converged fixed-cell
+relaxation. In-plane cell optimization, material-specific energy checks,
+and search integration remain later work. A converged fixed-cell
 candidate is not yet a validated 2D material or a minimum with respect to in-plane
 strain.
 
@@ -229,8 +229,9 @@ fingerprint backend required. They were verified with ASE 3.22.1 and 3.29.0.
 
 `validate_slab_candidate` checks a candidate's geometry, minimum atomic
 separations, and whether **all atoms and their xy repeats form one connected
-2D bond network**. Call it explicitly after relaxation; the generator, quench,
-archive, and bulk search do not call it automatically. For a reference sheet:
+2D bond network**. Call it explicitly after relaxation, or insert the candidate
+through `SlabArchive`, which calls it before insertion. The generator, quench,
+and bulk search do not call it automatically. For a reference sheet:
 
 ```python
 from ase.build import graphene
@@ -270,9 +271,75 @@ for the underlying cycle-translation criterion; no graph package is added.
 This is a configurable geometric bonding heuristic. In particular, detached
 van der Waals layers outside the cutoff fail this single-network criterion.
 Passing does not prove chemical bonding, energetic/dynamical stability, or
-quench convergence. Energy sanity checks, calculator compatibility, archive
-integration, and a complete 2D search remain separate work.
+quench convergence. Material-specific energy sanity checks, calculator
+compatibility, and a complete 2D search remain separate work.
 
 Run `python -m unittest discover -s tests -p test_slab_validation.py -v`.
 The validator and its tests use the existing base dependencies only. The focused
 tests were verified with ASE 3.22.1 and 3.29.0.
+
+## Slab archive and identity
+
+`SlabArchive` stores candidates for one **exact composition and atom count**
+under one slab geometry/fingerprint configuration. It validates candidates
+before computing fingerprints and reuses the existing archive's ranking,
+diversity selection, pooled features, and energy accessors. For an executable
+interface example with ASE's EMT calculator:
+
+```python
+from crisp.slab_archive import SlabArchive
+
+archive = SlabArchive(
+    SlabFingerprintCalculator(config, cutoff=3.2, natx=32), {"Cu": 1},
+    min_dist_ang=1.5, bond_scale=1.2,
+)
+candidate = prepare_slab(
+    Atoms("Cu", positions=[[0.0, 0.0, 0.0]], cell=[2.5, 2.5, 0.0]), config,
+)
+relaxed = quench_slab(candidate, config, EMT)
+added = archive.add(
+    relaxed, relaxed.get_potential_energy() / len(relaxed),
+    metadata={"generation": 0},
+)
+best = archive.get_best(1)[0]
+```
+
+The caller supplies a finite energy in eV/atom from the intended calculator.
+Use the same energy model and conventions throughout an archive. Insertion
+does not evaluate a calculator or infer relaxation convergence. At zero
+pressure, stored enthalpy equals energy; ranking uses no vacuum-dependent
+pressure-volume term. Different stoichiometries or supercell atom counts are
+rejected instead of comparing incompatible targets.
+
+Each candidate must pass the distance/connectivity validator and fingerprint
+image-clearance guard. Validation happens **before** normalization, so invalid
+PBC or a changed cell height is rejected. The stored copy is wrapped in xy,
+centered in z, and sorted by atomic number. This aligns species blocks for the
+existing Hungarian matcher; permutations within each species are matched by
+the matcher. The input and its calculator are preserved, stored atoms have no
+calculator, and nested metadata plus fingerprint arrays are copied.
+
+A duplicate requires both the species-matched fingerprint distance to be
+strictly below `fp_threshold` (default 0.03) and the energy difference to be
+strictly below `energy_threshold` (default 0.01 eV/atom). `add` returns `True`
+for insertion or `False` for a duplicate. It retains the **first** matching
+entry, including when a later near-duplicate has a slightly lower energy.
+Both duplicate thresholds must be finite and strictly positive.
+Finite-cutoff fingerprints provide approximate identity: no primitive-cell
+reduction, exact structural-equivalence proof, or supercell matching is added.
+
+Invalid candidates, nonfinite energies/descriptors, and changed geometry or
+fingerprint settings raise before insertion. Backend and matcher failures
+propagate. Changing `config`, `cutoff`, `natx`, or `orbital` on the fingerprint
+calculator requires a new archive, so cached descriptors cannot be mixed.
+Treat exposed archive entries and cached arrays as read-only.
+
+This step provides an in-memory archive. `save`, `load`, `save_checkpoint`, and
+`load_checkpoint` raise `NotImplementedError` without writing or reading files;
+the bulk persistence format does not record the required slab contract. Slab
+checkpoint compatibility is the next separate step. Bulk archives and
+`CRISPSearch` remain unchanged.
+
+Run `python -m unittest discover -s tests -p test_slab_archive.py -v`.
+Guard tests use the base dependencies; real descriptor tests require the
+`torch_fplib` preflight and source checkout documented above.
