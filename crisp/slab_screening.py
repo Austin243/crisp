@@ -54,8 +54,8 @@ def candidate_features(atoms, fp_calc):
     return _real_array(fp_calc.pool_with_std(fp), (2 * dimension,))
 
 
-def select_by_gp(features, training, config):
-    """Return pool index and predictions minimizing mean - kappa * std."""
+def fit_slab_gp(training, config):
+    """Fit one deterministic model for screening and optional atomic guidance."""
     model = ExactGP(length_scale=config.length_scale, noise=config.noise,
                     auto_tune=config.auto_tune, auto_tune_min_points=config.min_training_points)
     model.train(np.array([row["features"] for row in training]),
@@ -64,6 +64,13 @@ def select_by_gp(features, training, config):
                   model._y_mean, model._y_std, model.length_scale, model.noise):
         if value is None or np.iscomplexobj(value) or not np.isfinite(value).all():
             raise ValueError("Slab GP training produced nonfinite or complex state")
+    return model
+
+
+def select_by_gp(features, training, config, *, model=None):
+    """Rank by mean - kappa * std; optionally reuse an already fitted model."""
+    if model is None:
+        model = fit_slab_gp(training, config)
     predictions = []
     for feature in features:
         mean, std = model.predict(feature)

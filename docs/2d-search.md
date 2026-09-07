@@ -3,10 +3,10 @@
 `SlabRandomSearch` provides an opt-in, automated 2D search using
 the slab geometry, fingerprints, generation, atomic quench, validation, and archive
 components below. It samples in-plane cells and relaxes atoms with each cell fixed.
-Random search is the default; optional GP screening selects candidates before
-physical quench. This does **not** add a 2D mode to `CRISPSearch`, fingerprint-guided
-atomic movement, or in-plane lattice relaxation. Original bulk modules and package
-requirements are unchanged.
+Random search is the default. Optional mutations, GP screening and
+fingerprint-guided atomic moves propose candidates before an unbiased physical
+quench. This does **not** add a 2D mode to `CRISPSearch` or in-plane lattice
+relaxation. Original bulk modules and package requirements are unchanged.
 
 ## Geometry contract
 
@@ -515,7 +515,7 @@ or recovery of the ground state of an unknown material.
 ## GP candidate screening
 
 Pass `screening=SlabGPScreening()` to opt in to GP candidate selection. Omitting
-it, with mutations also disabled, preserves PR #8's candidate stream, outcomes,
+it, with mutations and guidance also disabled, preserves PR #8's candidate stream, outcomes,
 and version-1 checkpoints.
 The existing `ExactGP` implementation and original CRISP modules are unchanged.
 
@@ -550,8 +550,9 @@ when others exhaust generation, and reject the trial only if the pool is empty.
 There is still **at most one physical quench per trial**. Member zero retains
 the original trial seed; additional members use separate deterministic streams.
 
-Training pairs the **unrelaxed candidate's pooled fingerprint** with its valid
-post-quench energy. Relaxed archive fingerprints describe different geometries
+Training pairs the **physical quench input's pooled fingerprint** with its valid
+post-quench energy. When guidance is enabled below, this is the descriptor after
+guided movement. Relaxed archive fingerprints describe different geometries
 and are not substituted for these inputs. Both accepted and duplicate outcomes
 provide training rows; generation/quench/validation rejections do not. The most
 recent `max_training_points` valid rows are retained (default 128), bounding exact
@@ -575,7 +576,7 @@ and nonfinite scores propagate before quench; no silent random fallback is used.
 
 ### GP checkpoints and example
 
-Screening-enabled searches without mutations use **version-2** search checkpoints containing the
+Screening-enabled searches without mutations or guidance use **version-2** search checkpoints containing the
 same archive/progress information plus screening settings and the bounded raw
 training rows. The live GP object and inverse matrices are not serialized;
 deterministic retraining reconstructs them from saved data. Loading checks row
@@ -696,7 +697,7 @@ energies or fingerprints. Connectivity is checked after the existing unbiased
 physical quench, just as for randomly generated candidates. Each quench keeps
 the entire proposed cell fixed; changing a cell proposal does not optimize it.
 
-Mutation-enabled searches use **version-3** checkpoints, with GP training rows
+Mutation-enabled searches without guidance use **version-3** checkpoints, with GP training rows
 only when screening is enabled. Outcomes and accepted archive metadata contain
 `proposal={"source": "random" | "mutation", "parent_trial": ...}`; the parent is
 an earlier accepted trial, or `None` for random candidates. Failed generation has
@@ -725,20 +726,120 @@ coordinate differences below `1e-12` Angstrom. These are mechanics checks, not a
 recovery benchmark. Separate six-trial comparisons against PR #9 produced
 byte-identical v1/v2 checkpoints when mutations were disabled.
 
+## Fingerprint-guided atomic proposals
+
+Pass `guidance=SlabGuidance()` alongside `screening=SlabGPScreening()` to move the
+selected candidate along a GP acquisition gradient before the physical quench.
+Guidance requires screening and can be combined with mutations. Omitting it
+preserves the prior random, GP and mutation paths and their v1/v2/v3 checkpoints.
+
+```python
+from crisp.slab_guidance import SlabGuidance
+
+guided_archive = SlabArchive(
+    SlabFingerprintCalculator(search_config, cutoff=3.2, natx=32), {"Cu": 4},
+    min_dist_ang=1.5,
+)
+guided_search = SlabRandomSearch(
+    guided_archive, EMT, calculator_id="ASE-EMT-default", seed=23,
+    layer_groups=[1, 2, 80], max_generation_attempts=6, fmax=0.05, max_steps=200,
+    screening=SlabGPScreening(),
+    guidance=SlabGuidance(max_steps=5, max_step=0.05, max_backtracks=6),
+)
+guided_search.run(12, checkpoint="slab-guided-search.json")
+```
+
+Only GP selection trials receive guidance. Bootstrap, periodic GP exploration,
+and the mutation option's scheduled random-injection trials bypass it. A single
+frozen GP is fitted from the existing bounded training window for the whole
+trial. The driver screens the candidate pool, guides only its selected member,
+and then calls the existing `quench_slab` once with a fresh physical calculator.
+No physical calculator, energy, force or stress is used during guidance.
+
+The objective is `A = mean - kappa * std`, using the existing `ExactGP` and
+`BiasPotential` with anchor/repulsion terms disabled. The GP predicts energy
+after a quench from a given starting geometry. Its gradient is therefore a
+**heuristic direction for proposing structures**, not a physical interatomic
+force or a model of the potential-energy surface. `ForceProjector` applies the
+full mean-plus-standard-deviation chain rule through guarded slab fingerprints.
+The projected direction is `-d(N*A)/dR`, with all xyz coordinates free and no cell
+derivatives. Scores have eV/atom units but are never used as physical energies.
+
+`SlabGuidance` bounds accepted moves (`max_steps`, default 5), the largest atomic
+displacement per move (`max_step`, default 0.05 Angstrom), and backtracking
+(`max_backtracks`, default 6 halvings after the full step). Thus the maximum
+atomic displacement from the starting geometry is at most `max_steps * max_step`.
+Each trial step must satisfy geometry, image clearance and mixed-PBC minimum
+distances before any fingerprint evaluation. It is accepted only if the
+acquisition score strictly decreases. The cell, composition and physical PBC
+stay fixed; the helper does not wrap or recenter coordinates during movement.
+
+The helper stops at its move limit, at a projected maximum force norm no larger
+than `1e-12`, or when no tested step is both valid and downhill. It returns the
+last valid candidate for physical quenching; stopping is not a statement of
+physical convergence. Invalid inputs, nonfinite scores/gradients/forces and
+unexpected backend errors propagate before any physical quench. No silent
+fallback hides these failures. The standalone helper is
+`guide_slab(atoms, fp_calc, model, guidance, kappa=..., min_dist_ang=...)`, returning
+a calculator-free copy and movement details; supply a compatible, fitted GP.
+
+After guidance the driver recomputes the descriptor of the actual input to the
+unbiased quench. That descriptor is paired only with the final, validated physical
+energy, including duplicates. Guidance scores are kept separately in provenance.
+Rejected physical quenches/structures add no training row. Archive ranking,
+duplicate detection and final force convergence continue to use the physical
+calculator alone. Strictly lowering the GP score does not guarantee lower
+physical energy, a faster search, or recovery of a stable material.
+
+Guidance-enabled searches use **version-4** checkpoints. Each selected outcome
+records guidance mode, accepted steps, attempted steps, initial/final acquisition
+scores, and stopping reason (`flat`, `blocked`, or `budget`); bypassed modes have
+zero steps and no scores, and failed generation has no guidance record. Accepted
+archive metadata retains the same details. Loading validates modes, movement
+budgets, score descent and archive correspondence before restoring state. Resume
+requires the same settings and actual calculator/dependency versions; earlier
+checkpoint formats cannot enable guidance on reload. Live GP objects are rebuilt
+from training rows, not serialized.
+
+```sh
+python examples/slab_random_search.py --gp --guidance --trials 5 --checkpoint cu-guided.json
+python examples/slab_random_search.py --gp --guidance --resume --trials 7 --checkpoint cu-guided.json
+```
+
+Add `--mutations` to both commands to include parent mutations. Run the guidance
+checks with `python -m unittest discover -s tests -p 'test_slab_guidance*.py' -v`.
+
+With the versions above, real `s` and `sp` acquisition gradients matched central
+xyz finite differences on a buckled BNC sheet, including nonzero z response.
+Cu4/EMT runs with and without mutations exercised actual guided movement followed
+by unbiased relaxation; 3+5 restarts preserved all discrete decisions and matched
+numeric state within `1e-8`. Separately, disabling guidance produced byte-identical
+six-trial checkpoints and two-trial continuation against PR #10 in all four
+previous modes (random, GP, mutations, and GP plus mutations).
+
+In a seed-23 comparison with the example geometry, `natx=64`, default options and
+12 actual physical quenches per arm, guidance took 14 accepted steps without
+mutations and 30 with mutations. The best archived energy remained
+0.7524389956 eV/atom in all arms. Adding guidance changed EMT evaluations from
+246 to 246 without mutations and 224 to 230 with mutations; descriptor calls
+increased from 42 to 113 and 124, respectively, plus 18 and 30 force projections.
+**This small comparison shows no efficiency improvement.** It verifies the
+mechanics and extra computational cost, not material recovery.
+
 ## Remaining PRs
 
 PR #8 provides functioning **fixed-cell random search over sampled 2D cells**;
-PR #9 adds optional GP selection and PR #10 adds bounded mutations with random
-injection. The next small PRs should preserve bulk defaults:
+PR #9 adds optional GP selection, PR #10 adds bounded mutations with random
+injection, and PR #11 adds fingerprint-guided proposals before unbiased quenching.
+The next small PRs should preserve bulk defaults:
 
 | PR | Scope | Acceptance milestone |
 | --- | --- | --- |
-| 11 | Add fingerprint-guided atomic movement and final unbiased physical quench. | Real calculator energy alone ranks candidates; forces and slab bounds remain valid. |
 | 12 | Relax a/b and in-plane shear while keeping c and out-of-plane tilt fixed. | Verify in-plane derivatives/stress and results under changes in vacuum. |
 | 13 | Add target-material recovery benchmarks and documented operating settings. | Recover reference sheets across seeds, converge budgets, validate the energy model and compare with trusted relaxation results. |
 
-The driver is now optionally GP-assisted; after #11 it includes fingerprint-guided
-movement; after #12 it can optimize in-plane lattice parameters. Readiness for
+The driver now supports optional GP selection and fingerprint-guided movement;
+after #12 it can optimize in-plane lattice parameters. Readiness for
 scientific predictions requires the material-specific evidence in #13, not only
 a completed PR count. HPC execution and more advanced finishers can follow.
 
