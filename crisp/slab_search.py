@@ -1,4 +1,4 @@
-"""Bounded local random search over slab cells, separate from CRISPSearch."""
+"""Bounded local slab search with optional GP screening and parent mutations."""
 
 from collections import Counter
 from copy import deepcopy
@@ -12,6 +12,7 @@ from .slab import _ATOL
 from .slab_archive import SlabArchive, _check_fields, _read_slab_json, _write_slab_json
 from .slab_fingerprint import _IMAGE_MARGIN
 from .slab_generation import SlabGenerationError, generate_slabs
+from .slab_mutation import SlabMutations, mutate_slab
 from .slab_relaxation import SlabQuenchBoundsError, SlabQuenchNotConverged, quench_slab
 from .slab_screening import SlabGPScreening, _real_array, candidate_features, select_by_gp
 from .slab_validation import validate_slab_candidate
@@ -29,7 +30,8 @@ class SlabRandomSearch:
     mixed PBC. The entire sampled cell stays fixed during each atomic quench.
     run(n_trials) requests that many additional trials, including rejections;
     each trial allows at most one quench. Optional screening ranks candidate
-    pools with ExactGP; atomic bias and cell relaxation are not used.
+    pools with ExactGP. Optional mutations perturb archived parents between
+    random trials; atomic bias and cell relaxation are not used.
 
     calculator_id is a caller-supplied energy-model label, checked on resume;
     the caller must also supply the same actual model and dependency versions.
@@ -39,9 +41,12 @@ class SlabRandomSearch:
     def __init__(self, archive: SlabArchive, calc_factory, *, calculator_id: str,
                  seed: int = 0, layer_groups=None, max_generation_attempts: int = 20,
                  fmax: float = 0.05, max_steps: int = 200,
-                 screening: SlabGPScreening | None = None):
+                 screening: SlabGPScreening | None = None,
+                 mutations: SlabMutations | None = None):
         if screening is not None and not isinstance(screening, SlabGPScreening):
             raise TypeError("screening must be SlabGPScreening or None")
+        if mutations is not None and not isinstance(mutations, SlabMutations):
+            raise TypeError("mutations must be SlabMutations or None")
         if not isinstance(archive, SlabArchive) or archive.entries:
             raise ValueError("Start SlabRandomSearch with an empty SlabArchive; use load to resume")
         if not callable(calc_factory):
@@ -68,6 +73,7 @@ class SlabRandomSearch:
         self.outcomes = []
         self.training_rows = []
         self._screening = screening
+        self._mutations = mutations
         self._archive_settings = archive_settings
         self._settings = dict(calculator_id=calculator_id, seed=int(seed),
                               layer_groups=sorted(set(int(g) for g in groups)),
@@ -75,6 +81,8 @@ class SlabRandomSearch:
                               fmax=float(fmax), max_steps=int(max_steps))
         if screening is not None:
             self._settings["screening"] = asdict(screening)
+        if mutations is not None:
+            self._settings["mutations"] = asdict(mutations)
 
     @property
     def completed_trials(self):
@@ -126,17 +134,21 @@ class SlabRandomSearch:
         config = self.archive.fp_calc.config
         outcome = dict(trial=index + 1, seed=self._trial_seed(index), status=None,
                        reason=None, energy_per_atom=None, quench_steps=None)
+        if self._mutations is not None:
+            outcome["proposal"] = None
         feature = None
         if self._screening is None:
             try:
-                candidate = self._generate(outcome["seed"])
+                candidate, proposal = self._candidate(index)
             except SlabGenerationError as exc:
                 return outcome | dict(status="generation_rejected", reason=str(exc))
         else:
-            candidate, feature, details, error = self._screen_candidate(index)
+            candidate, feature, details, proposal, error = self._screen_candidate(index)
             outcome["screening"] = details
             if candidate is None:
                 return outcome | dict(status="generation_rejected", reason=error)
+        if self._mutations is not None:
+            outcome["proposal"] = proposal
         try:
             relaxed = quench_slab(candidate, config, self.calc_factory,
                                   fmax=options["fmax"], max_steps=options["max_steps"])
@@ -175,6 +187,27 @@ class SlabRandomSearch:
         sequence = np.random.SeedSequence([self._settings["seed"], index, member, 9])
         return int(sequence.generate_state(1, dtype=np.uint64)[0])
 
+    def _proposal(self, index, member, accepted_trials, mode=None):
+        """Derive source and parent from completed history, without mutable RNG state."""
+        if (not accepted_trials or (index + 1) % self._mutations.random_every == 0
+                or (self._screening is not None and mode != "gp")):
+            return dict(source="random", parent_trial=None)
+        rng = np.random.default_rng(np.random.SeedSequence([self._pool_seed(index, member), 10]))
+        return dict(source="mutation", parent_trial=accepted_trials[int(rng.integers(len(accepted_trials)))])
+
+    def _candidate(self, index, member=0, mode=None):
+        seed = self._pool_seed(index, member)
+        if self._mutations is None:
+            return self._generate(seed), None
+        accepted_trials = [entry.metadata["search_trial"] for entry in self.archive.entries]
+        proposal = self._proposal(index, member, accepted_trials, mode)
+        if proposal["source"] == "random":
+            return self._generate(seed), proposal
+        parent = self.archive.entries[accepted_trials.index(proposal["parent_trial"])].atoms
+        candidate = mutate_slab(parent, self.archive.fp_calc.config, self._mutations,
+                                seed=seed, min_dist_ang=self.archive.min_dist_ang)
+        return candidate, proposal
+
     def _screening_mode(self, index, n_training):
         if n_training < self._screening.min_training_points:
             return "bootstrap"
@@ -185,33 +218,36 @@ class SlabRandomSearch:
         requested = self._screening.pool_size if mode == "gp" else 1
         details = dict(mode=mode, requested=requested, generated=0, selected_member=None,
                        candidate_seed=None, mean=None, std=None, score=None)
-        candidates, features, members = [], [], []
+        candidates, features, members, proposals = [], [], [], []
         error = None
         for member in range(requested):
             try:
-                candidate = self._generate(self._pool_seed(index, member))
+                candidate, proposal = self._candidate(index, member, mode)
             except SlabGenerationError as exc:
                 error = str(exc)
                 continue
             features.append(candidate_features(candidate, self.archive.fp_calc))
             candidates.append(candidate)
             members.append(member)
+            proposals.append(proposal)
         details["generated"] = len(candidates)
         if not candidates:
-            return None, None, details, error
+            return None, None, details, None, error
         selected = 0
         if mode == "gp":
             selected, predictions = select_by_gp(features, self.training_rows, self._screening)
             details.update(predictions[selected])
         details.update(selected_member=members[selected],
                        candidate_seed=self._pool_seed(index, members[selected]))
-        return candidates[selected], features[selected], details, None
+        return candidates[selected], features[selected], details, proposals[selected], None
 
     def _entry_metadata(self, outcome):
         metadata = dict(search_trial=outcome["trial"], trial_seed=outcome["seed"],
                         calculator_id=self._settings["calculator_id"])
         if self._screening is not None:
             metadata["candidate_seed"] = outcome["screening"]["candidate_seed"]
+        if self._mutations is not None:
+            metadata["proposal"] = deepcopy(outcome["proposal"])
         return metadata
 
     def save(self, path):
@@ -222,6 +258,8 @@ class SlabRandomSearch:
                        archive=self.archive._to_payload())
         if self._screening is not None:
             payload.update(version=2, training=self.training_rows)
+        if self._mutations is not None:
+            payload["version"] = 3
         _write_slab_json(path, payload)
 
     def load(self, path):
@@ -233,6 +271,8 @@ class SlabRandomSearch:
             fields.add("training")
         _check_fields(payload, fields)
         version = 1 if self._screening is None else 2
+        if self._mutations is not None:
+            version = 3
         if (payload["format"] != "crisp-slab-search"
                 or type(payload["version"]) is not int or payload["version"] != version):
             raise ValueError("Unsupported slab search checkpoint format/version")
@@ -242,10 +282,13 @@ class SlabRandomSearch:
         if not isinstance(outcomes, list):
             raise ValueError("Slab search outcomes must be a list")
         n_training = 0
+        accepted_trials = []
         for index, outcome in enumerate(outcomes):
             fields = {"trial", "seed", "status", "reason", "energy_per_atom", "quench_steps"}
             if self._screening is not None:
                 fields.add("screening")
+            if self._mutations is not None:
+                fields.add("proposal")
             _check_fields(outcome, fields)
             if (type(outcome["trial"]) is not int or outcome["trial"] != index + 1
                     or type(outcome["seed"]) is not int or outcome["seed"] != self._trial_seed(index)
@@ -268,6 +311,10 @@ class SlabRandomSearch:
             if self._screening is not None:
                 self._validate_screening(outcome, index, n_training)
                 n_training += outcome["status"] in ("accepted", "duplicate")
+            if self._mutations is not None:
+                self._validate_proposal(outcome, index, accepted_trials)
+            if outcome["status"] == "accepted":
+                accepted_trials.append(outcome["trial"])
         training = self._validated_training(payload["training"], outcomes) if self._screening else []
         target._load_payload(payload["archive"])
         accepted = [outcome for outcome in outcomes if outcome["status"] == "accepted"]
@@ -278,6 +325,21 @@ class SlabRandomSearch:
         self.archive.entries = target.entries
         self.outcomes = deepcopy(outcomes)
         self.training_rows = training
+
+    def _validate_proposal(self, outcome, index, accepted_trials):
+        proposal = outcome["proposal"]
+        if outcome["status"] == "generation_rejected":
+            if proposal is not None:
+                raise ValueError("Failed generation cannot contain a selected proposal")
+            return
+        _check_fields(proposal, {"source", "parent_trial"})
+        if proposal["parent_trial"] is not None:
+            _integer("parent_trial", proposal["parent_trial"], 1)
+        selection = outcome.get("screening", {})
+        expected = self._proposal(index, selection.get("selected_member", 0), accepted_trials,
+                                  selection.get("mode"))
+        if proposal != expected:
+            raise ValueError("Slab proposal source/parent does not match completed history")
 
     def _validate_screening(self, outcome, index, n_training):
         details = outcome["screening"]

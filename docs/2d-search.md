@@ -404,7 +404,7 @@ The archive tests pass with ASE 3.22.1 and 3.29.0, including real `s`/`sp` round
 
 ## Automated local random search
 
-`SlabRandomSearch` generates one candidate per trial, quenches all atomic xyz
+By default, `SlabRandomSearch` generates one candidate per trial, quenches all atomic xyz
 coordinates at fixed cell, checks distances and periodic connectivity, and inserts
 distinct candidates into `SlabArchive`. It ranks the physical energy per atom.
 Start with an empty archive, an explicit energy-model label, and a factory that
@@ -441,11 +441,11 @@ status, rejection reason, and (after successful quench) energy and step count:
 | --- | --- |
 | `accepted` | A converged, validated, distinct slab was inserted. |
 | `duplicate` | The existing fingerprint-plus-energy identity rule matched an entry. |
-| `generation_rejected` | The per-trial PyXtal attempt budget was exhausted. |
+| `generation_rejected` | Candidate generation exhausted its bounded attempts (PyXtal or optional mutations). |
 | `quench_rejected` | Relaxation crossed slab geometry bounds or exhausted its step budget. |
 | `validation_rejected` | The converged candidate failed distance/connectivity checks. |
 
-Each trial makes at most one quench request, at most `max_generation_attempts`
+In default random mode, each trial makes at most one quench request, at most `max_generation_attempts`
 PyXtal calls, and at most `max_steps` optimizer moves. These are not limits on
 wall time or exact calculator evaluations. Zero trials makes no candidate or
 calculator calls; zero optimizer steps accepts only initially converged candidates.
@@ -462,7 +462,7 @@ callers can also inspect the full `outcomes` list directly.
 
 ### Resume and output
 
-`search.save(path)` writes one atomic `crisp-slab-search`, version 1, JSON file
+In default random mode, `search.save(path)` writes one atomic `crisp-slab-search`, version 1, JSON file
 containing search settings, all completed outcomes, and the validated archive
 format. Passing `checkpoint=path` to `run` saves after **every completed trial**,
 including rejections, so an interrupted run can resume at the next unsaved trial.
@@ -515,7 +515,8 @@ or recovery of the ground state of an unknown material.
 ## GP candidate screening
 
 Pass `screening=SlabGPScreening()` to opt in to GP candidate selection. Omitting
-it preserves PR #8's candidate stream, outcomes, and version-1 checkpoints.
+it, with mutations also disabled, preserves PR #8's candidate stream, outcomes,
+and version-1 checkpoints.
 The existing `ExactGP` implementation and original CRISP modules are unchanged.
 
 ```python
@@ -574,7 +575,7 @@ and nonfinite scores propagate before quench; no silent random fallback is used.
 
 ### GP checkpoints and example
 
-Screening-enabled searches use **version-2** search checkpoints containing the
+Screening-enabled searches without mutations use **version-2** search checkpoints containing the
 same archive/progress information plus screening settings and the bounded raw
 training rows. The live GP object and inverse matrices are not serialized;
 deterministic retraining reconstructs them from saved data. Loading checks row
@@ -635,14 +636,103 @@ benchmarks and tuning are still needed before relying on GP screening for speed.
 Run `python -m unittest discover -s tests -p 'test_slab_*screen*.py' -v` and
 `python -m unittest discover -s tests -p 'test_slab_gp*.py' -v` for GP-specific checks.
 
+## Mutations of archived slabs
+
+Pass `mutations=SlabMutations()` to propose structures near previously accepted
+slabs. This option works with or without GP screening. The default `None` keeps
+the previous random/GP behavior and version-1/version-2 checkpoints unchanged.
+The original bulk search and its mutation operators are unchanged.
+
+```python
+from crisp.slab_mutation import SlabMutations
+
+mutation_archive = SlabArchive(
+    SlabFingerprintCalculator(search_config, cutoff=3.2, natx=32), {"Cu": 4},
+    min_dist_ang=1.5,
+)
+mutation_search = SlabRandomSearch(
+    mutation_archive, EMT, calculator_id="ASE-EMT-default", seed=23,
+    layer_groups=[1, 2, 80], max_generation_attempts=6, fmax=0.05, max_steps=200,
+    mutations=SlabMutations(max_displacement=0.2, max_strain=0.05,
+                            random_every=5, max_attempts=20),
+)
+mutation_search.run(8, checkpoint="slab-mutations.json")
+```
+
+A trial uses random generation when the archive is empty or its one-based trial
+number is a multiple of `random_every`. With GP enabled, bootstrap and exploration
+trials also remain random. Other trials choose parents uniformly from all accepted
+archive entries, using a local stream derived from the trial/member seed. The
+whole GP pool uses the same source, with independent parent choices per member;
+only the selected candidate receives a physical quench. Duplicate and rejected
+outcomes do not become parents. `random_every=1` requests random generation on
+every trial. Random injection is an attempt; it can still be rejected.
+
+`mutate_slab(parent, config, mutations, seed=..., min_dist_ang=...)` is also
+available as a standalone helper. Each attempt starts from a fresh parent copy:
+
+- Apply a symmetric in-plane strain whose Frobenius norm is at most `max_strain`
+  (dimensionless, less than 1). Transform cell vectors and atomic xy coordinates
+  together; c and atomic z are not scaled. This bounds each principal strain.
+- Add a random atomic displacement of at most `max_displacement` Angstrom per
+  atom. The bound applies before periodic wrapping and rigid z centering. A slab
+  with `max_thickness=0` receives only xy moves; other slabs can buckle.
+- Wrap xy, center the sheet, and check area, thickness, vacuum and minimum
+  distances, including periodic self-images. No clipping repairs invalid proposals.
+
+The helper preserves composition and physical PBC `(True, True, False)`, leaves
+the parent and its calculator untouched, and returns a calculator-free copy.
+Stale layer-group and quench labels are removed; `origin="mutation"` and the
+successful `mutation_attempt` are recorded. Set either amplitude to zero for
+atomic-only or cell-only proposals; at least one must be positive. An exactly
+fixed area usually needs `max_strain=0`. Strain bounds apply relative to each
+parent, so cell shapes can drift across generations within the slab bounds.
+
+Each mutation candidate has at most `max_attempts` proposals. Exhaustion raises
+`SlabMutationError`, a `SlabGenerationError`, and consumes a `generation_rejected`
+trial if no pool member succeeds. It does not silently switch to random generation.
+Invalid options/parents and unexpected errors propagate. Mutations do not evaluate
+energies or fingerprints. Connectivity is checked after the existing unbiased
+physical quench, just as for randomly generated candidates. Each quench keeps
+the entire proposed cell fixed; changing a cell proposal does not optimize it.
+
+Mutation-enabled searches use **version-3** checkpoints, with GP training rows
+only when screening is enabled. Outcomes and accepted archive metadata contain
+`proposal={"source": "random" | "mutation", "parent_trial": ...}`; the parent is
+an earlier accepted trial, or `None` for random candidates. Failed generation has
+no selected proposal. Loading validates source schedules, deterministic parent
+selection, and archive correspondence before replacing live state. Resume requires
+the same mutation settings; existing v1/v2 runs cannot switch modes on reload.
+
+```sh
+python examples/slab_random_search.py --mutations --trials 3 --checkpoint cu-mutations.json
+python examples/slab_random_search.py --mutations --resume --trials 5 --checkpoint cu-mutations.json
+```
+
+Add `--gp` to both commands to combine mutations and GP screening. These options
+expand the proposal mechanism; they do not establish improved search efficiency
+or material stability. Run the mutation checks with
+`python -m unittest discover -s tests -p 'test_slab_mutation*.py' -v`.
+
+With the versions above, Cu4/EMT, seed 23, the example geometry, `natx=64` and
+default mutation settings, 12 trials retained 5 distinct slabs (7 duplicates).
+Nine selected candidates were mutations and three were random. Adding default
+GP screening retained 7 slabs (5 duplicates), with six mutation and six random
+selections. Both runs started 12 physical quenches; 11 moved atoms. Every quench
+kept its proposed cell fixed. Splitting each run at 5+7 preserved statuses,
+selected parents and cells; energy differences were below `3e-15` eV/atom and
+coordinate differences below `1e-12` Angstrom. These are mechanics checks, not a
+recovery benchmark. Separate six-trial comparisons against PR #9 produced
+byte-identical v1/v2 checkpoints when mutations were disabled.
+
 ## Remaining PRs
 
 PR #8 provides functioning **fixed-cell random search over sampled 2D cells**;
-PR #9 adds optional GP selection. The next small PRs should preserve bulk defaults:
+PR #9 adds optional GP selection and PR #10 adds bounded mutations with random
+injection. The next small PRs should preserve bulk defaults:
 
 | PR | Scope | Acceptance milestone |
 | --- | --- | --- |
-| 10 | Add bounded atomic and in-plane cell mutations of archived parents. | Mutations preserve composition, c, physical PBC and bounds; random injection continues. |
 | 11 | Add fingerprint-guided atomic movement and final unbiased physical quench. | Real calculator energy alone ranks candidates; forces and slab bounds remain valid. |
 | 12 | Relax a/b and in-plane shear while keeping c and out-of-plane tilt fixed. | Verify in-plane derivatives/stress and results under changes in vacuum. |
 | 13 | Add target-material recovery benchmarks and documented operating settings. | Recover reference sheets across seeds, converge budgets, validate the energy model and compare with trusted relaxation results. |
