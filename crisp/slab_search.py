@@ -12,9 +12,10 @@ from .slab import _ATOL
 from .slab_archive import SlabArchive, _check_fields, _read_slab_json, _write_slab_json
 from .slab_fingerprint import _IMAGE_MARGIN
 from .slab_generation import SlabGenerationError, generate_slabs
+from .slab_guidance import SlabGuidance, guide_slab
 from .slab_mutation import SlabMutations, mutate_slab
 from .slab_relaxation import SlabQuenchBoundsError, SlabQuenchNotConverged, quench_slab
-from .slab_screening import SlabGPScreening, _real_array, candidate_features, select_by_gp
+from .slab_screening import SlabGPScreening, _real_array, candidate_features, fit_slab_gp, select_by_gp
 from .slab_validation import validate_slab_candidate
 
 
@@ -31,7 +32,8 @@ class SlabRandomSearch:
     run(n_trials) requests that many additional trials, including rejections;
     each trial allows at most one quench. Optional screening ranks candidate
     pools with ExactGP. Optional mutations perturb archived parents between
-    random trials; atomic bias and cell relaxation are not used.
+    random trials. Optional fingerprint guidance precedes the unbiased physical
+    quench; neither stage relaxes the cell.
 
     calculator_id is a caller-supplied energy-model label, checked on resume;
     the caller must also supply the same actual model and dependency versions.
@@ -42,11 +44,17 @@ class SlabRandomSearch:
                  seed: int = 0, layer_groups=None, max_generation_attempts: int = 20,
                  fmax: float = 0.05, max_steps: int = 200,
                  screening: SlabGPScreening | None = None,
-                 mutations: SlabMutations | None = None):
+                 mutations: SlabMutations | None = None,
+                 guidance: SlabGuidance | None = None):
         if screening is not None and not isinstance(screening, SlabGPScreening):
             raise TypeError("screening must be SlabGPScreening or None")
         if mutations is not None and not isinstance(mutations, SlabMutations):
             raise TypeError("mutations must be SlabMutations or None")
+        if guidance is not None:
+            if not isinstance(guidance, SlabGuidance):
+                raise TypeError("guidance must be SlabGuidance or None")
+            if screening is None:
+                raise ValueError("Slab guidance requires GP screening")
         if not isinstance(archive, SlabArchive) or archive.entries:
             raise ValueError("Start SlabRandomSearch with an empty SlabArchive; use load to resume")
         if not callable(calc_factory):
@@ -74,6 +82,7 @@ class SlabRandomSearch:
         self.training_rows = []
         self._screening = screening
         self._mutations = mutations
+        self._guidance = guidance
         self._archive_settings = archive_settings
         self._settings = dict(calculator_id=calculator_id, seed=int(seed),
                               layer_groups=sorted(set(int(g) for g in groups)),
@@ -83,6 +92,8 @@ class SlabRandomSearch:
             self._settings["screening"] = asdict(screening)
         if mutations is not None:
             self._settings["mutations"] = asdict(mutations)
+        if guidance is not None:
+            self._settings["guidance"] = asdict(guidance)
 
     @property
     def completed_trials(self):
@@ -136,6 +147,8 @@ class SlabRandomSearch:
                        reason=None, energy_per_atom=None, quench_steps=None)
         if self._mutations is not None:
             outcome["proposal"] = None
+        if self._guidance is not None:
+            outcome["guidance"] = None
         feature = None
         if self._screening is None:
             try:
@@ -143,12 +156,22 @@ class SlabRandomSearch:
             except SlabGenerationError as exc:
                 return outcome | dict(status="generation_rejected", reason=str(exc))
         else:
-            candidate, feature, details, proposal, error = self._screen_candidate(index)
+            candidate, feature, details, proposal, model, error = self._screen_candidate(index)
             outcome["screening"] = details
             if candidate is None:
                 return outcome | dict(status="generation_rejected", reason=error)
         if self._mutations is not None:
             outcome["proposal"] = proposal
+        if self._guidance is not None:
+            mode = self._guidance_mode(index, details["mode"])
+            guided = dict(steps=0, attempts=0, initial_score=None, final_score=None, stop=None)
+            if mode == "guided":
+                candidate, guided = guide_slab(
+                    candidate, self.archive.fp_calc, model, self._guidance,
+                    kappa=self._screening.kappa, min_dist_ang=self.archive.min_dist_ang)
+                # Train on the actual input to the unbiased physical quench.
+                feature = candidate_features(candidate, self.archive.fp_calc)
+            outcome["guidance"] = dict(mode=mode, **guided)
         try:
             relaxed = quench_slab(candidate, config, self.calc_factory,
                                   fmax=options["fmax"], max_steps=options["max_steps"])
@@ -213,6 +236,13 @@ class SlabRandomSearch:
             return "bootstrap"
         return "explore" if (index + 1) % self._screening.explore_every == 0 else "gp"
 
+    def _guidance_mode(self, index, screening_mode):
+        if screening_mode != "gp":
+            return screening_mode
+        if self._mutations is not None and (index + 1) % self._mutations.random_every == 0:
+            return "random_injection"
+        return "guided"
+
     def _screen_candidate(self, index):
         mode = self._screening_mode(index, len(self.training_rows))
         requested = self._screening.pool_size if mode == "gp" else 1
@@ -232,14 +262,19 @@ class SlabRandomSearch:
             proposals.append(proposal)
         details["generated"] = len(candidates)
         if not candidates:
-            return None, None, details, None, error
+            return None, None, details, None, None, error
         selected = 0
+        model = None
         if mode == "gp":
-            selected, predictions = select_by_gp(features, self.training_rows, self._screening)
+            if self._guidance is None:
+                selected, predictions = select_by_gp(features, self.training_rows, self._screening)
+            else:
+                model = fit_slab_gp(self.training_rows, self._screening)
+                selected, predictions = select_by_gp(features, self.training_rows, self._screening, model=model)
             details.update(predictions[selected])
         details.update(selected_member=members[selected],
                        candidate_seed=self._pool_seed(index, members[selected]))
-        return candidates[selected], features[selected], details, proposals[selected], None
+        return candidates[selected], features[selected], details, proposals[selected], model, None
 
     def _entry_metadata(self, outcome):
         metadata = dict(search_trial=outcome["trial"], trial_seed=outcome["seed"],
@@ -248,6 +283,8 @@ class SlabRandomSearch:
             metadata["candidate_seed"] = outcome["screening"]["candidate_seed"]
         if self._mutations is not None:
             metadata["proposal"] = deepcopy(outcome["proposal"])
+        if self._guidance is not None:
+            metadata["guidance"] = deepcopy(outcome["guidance"])
         return metadata
 
     def save(self, path):
@@ -260,6 +297,8 @@ class SlabRandomSearch:
             payload.update(version=2, training=self.training_rows)
         if self._mutations is not None:
             payload["version"] = 3
+        if self._guidance is not None:
+            payload["version"] = 4
         _write_slab_json(path, payload)
 
     def load(self, path):
@@ -273,6 +312,8 @@ class SlabRandomSearch:
         version = 1 if self._screening is None else 2
         if self._mutations is not None:
             version = 3
+        if self._guidance is not None:
+            version = 4
         if (payload["format"] != "crisp-slab-search"
                 or type(payload["version"]) is not int or payload["version"] != version):
             raise ValueError("Unsupported slab search checkpoint format/version")
@@ -289,6 +330,8 @@ class SlabRandomSearch:
                 fields.add("screening")
             if self._mutations is not None:
                 fields.add("proposal")
+            if self._guidance is not None:
+                fields.add("guidance")
             _check_fields(outcome, fields)
             if (type(outcome["trial"]) is not int or outcome["trial"] != index + 1
                     or type(outcome["seed"]) is not int or outcome["seed"] != self._trial_seed(index)
@@ -313,6 +356,8 @@ class SlabRandomSearch:
                 n_training += outcome["status"] in ("accepted", "duplicate")
             if self._mutations is not None:
                 self._validate_proposal(outcome, index, accepted_trials)
+            if self._guidance is not None:
+                self._validate_guidance(outcome, index)
             if outcome["status"] == "accepted":
                 accepted_trials.append(outcome["trial"])
         training = self._validated_training(payload["training"], outcomes) if self._screening else []
@@ -325,6 +370,42 @@ class SlabRandomSearch:
         self.archive.entries = target.entries
         self.outcomes = deepcopy(outcomes)
         self.training_rows = training
+
+    def _validate_guidance(self, outcome, index):
+        details = outcome["guidance"]
+        if outcome["status"] == "generation_rejected":
+            if details is not None:
+                raise ValueError("Failed generation cannot contain guidance")
+            return
+        _check_fields(details, {"mode", "steps", "attempts", "initial_score", "final_score", "stop"})
+        mode = self._guidance_mode(index, outcome["screening"]["mode"])
+        if details["mode"] != mode:
+            raise ValueError("Invalid slab guidance mode")
+        steps, attempts = details["steps"], details["attempts"]
+        _integer("guidance steps", steps, 0)
+        _integer("guidance attempts", attempts, 0)
+        if mode != "guided":
+            if steps or attempts or any(details[key] is not None for key in
+                                         ("initial_score", "final_score", "stop")):
+                raise ValueError("Skipped guidance cannot contain movement results")
+            return
+        if (details["stop"] not in ("flat", "blocked", "budget")
+                or (details["stop"] == "budget") != (steps == self._guidance.max_steps)
+                or steps > self._guidance.max_steps):
+            raise ValueError("Invalid slab guidance stopping reason")
+        per_move = self._guidance.max_backtracks + 1
+        minimum, maximum = steps, steps * per_move
+        if details["stop"] == "blocked":
+            minimum += per_move
+            maximum += per_move
+        if not minimum <= attempts <= maximum:
+            raise ValueError("Slab guidance exceeds its move/attempt budget")
+        for key in ("initial_score", "final_score"):
+            if type(details[key]) not in (int, float) or not np.isfinite(details[key]):
+                raise ValueError("Invalid slab guidance score")
+        initial, final = details["initial_score"], details["final_score"]
+        if (steps == 0 and final != initial) or (steps > 0 and final >= initial):
+            raise ValueError("Slab guidance must decrease its acquisition score")
 
     def _validate_proposal(self, outcome, index, accepted_trials):
         proposal = outcome["proposal"]
