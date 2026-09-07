@@ -2,6 +2,7 @@
 
 from collections import Counter
 from copy import deepcopy
+from dataclasses import asdict
 import logging
 from numbers import Integral
 
@@ -12,6 +13,7 @@ from .slab_archive import SlabArchive, _check_fields, _read_slab_json, _write_sl
 from .slab_fingerprint import _IMAGE_MARGIN
 from .slab_generation import SlabGenerationError, generate_slabs
 from .slab_relaxation import SlabQuenchBoundsError, SlabQuenchNotConverged, quench_slab
+from .slab_screening import SlabGPScreening, _real_array, candidate_features, select_by_gp
 from .slab_validation import validate_slab_candidate
 
 
@@ -26,16 +28,20 @@ class SlabRandomSearch:
     Start with an empty SlabArchive and a fresh-calculator factory supporting
     mixed PBC. The entire sampled cell stays fixed during each atomic quench.
     run(n_trials) requests that many additional trials, including rejections;
-    each trial allows at most one quench. GP/bias/cell relaxation are not used.
+    each trial allows at most one quench. Optional screening ranks candidate
+    pools with ExactGP; atomic bias and cell relaxation are not used.
 
     calculator_id is a caller-supplied energy-model label, checked on resume;
     the caller must also supply the same actual model and dependency versions.
-    Treat archive, outcomes and settings as read-only during a search.
+    Treat archive, outcomes, training_rows and settings as read-only during a search.
     """
 
     def __init__(self, archive: SlabArchive, calc_factory, *, calculator_id: str,
                  seed: int = 0, layer_groups=None, max_generation_attempts: int = 20,
-                 fmax: float = 0.05, max_steps: int = 200):
+                 fmax: float = 0.05, max_steps: int = 200,
+                 screening: SlabGPScreening | None = None):
+        if screening is not None and not isinstance(screening, SlabGPScreening):
+            raise TypeError("screening must be SlabGPScreening or None")
         if not isinstance(archive, SlabArchive) or archive.entries:
             raise ValueError("Start SlabRandomSearch with an empty SlabArchive; use load to resume")
         if not callable(calc_factory):
@@ -60,11 +66,15 @@ class SlabRandomSearch:
         self.archive = archive
         self.calc_factory = calc_factory
         self.outcomes = []
+        self.training_rows = []
+        self._screening = screening
         self._archive_settings = archive_settings
         self._settings = dict(calculator_id=calculator_id, seed=int(seed),
                               layer_groups=sorted(set(int(g) for g in groups)),
                               max_generation_attempts=int(max_generation_attempts),
                               fmax=float(fmax), max_steps=int(max_steps))
+        if screening is not None:
+            self._settings["screening"] = asdict(screening)
 
     @property
     def completed_trials(self):
@@ -116,13 +126,17 @@ class SlabRandomSearch:
         config = self.archive.fp_calc.config
         outcome = dict(trial=index + 1, seed=self._trial_seed(index), status=None,
                        reason=None, energy_per_atom=None, quench_steps=None)
-        try:
-            candidate = generate_slabs(
-                self._archive_settings["composition"], config, 1, seed=outcome["seed"],
-                layer_groups=options["layer_groups"], min_dist_ang=self.archive.min_dist_ang,
-                max_attempts=options["max_generation_attempts"])[0]
-        except SlabGenerationError as exc:
-            return outcome | dict(status="generation_rejected", reason=str(exc))
+        feature = None
+        if self._screening is None:
+            try:
+                candidate = self._generate(outcome["seed"])
+            except SlabGenerationError as exc:
+                return outcome | dict(status="generation_rejected", reason=str(exc))
+        else:
+            candidate, feature, details, error = self._screen_candidate(index)
+            outcome["screening"] = details
+            if candidate is None:
+                return outcome | dict(status="generation_rejected", reason=error)
         try:
             relaxed = quench_slab(candidate, config, self.calc_factory,
                                   fmax=options["fmax"], max_steps=options["max_steps"])
@@ -141,35 +155,98 @@ class SlabRandomSearch:
                                     bond_scale=self.archive.bond_scale)
         except ValueError as exc:
             return outcome | dict(status="validation_rejected", reason=str(exc))
+        if feature is not None:
+            row = dict(trial=index + 1, features=feature.tolist(), energy_per_atom=energy)
+            training = (self.training_rows + [row])[-self._screening.max_training_points:]
         added = self.archive.add(relaxed, energy, metadata=self._entry_metadata(outcome))
+        if feature is not None:
+            self.training_rows = training
         return outcome | dict(status="accepted" if added else "duplicate")
 
+    def _generate(self, seed):
+        return generate_slabs(
+            self._archive_settings["composition"], self.archive.fp_calc.config, 1, seed=seed,
+            layer_groups=self._settings["layer_groups"], min_dist_ang=self.archive.min_dist_ang,
+            max_attempts=self._settings["max_generation_attempts"])[0]
+
+    def _pool_seed(self, index, member):
+        if member == 0:
+            return self._trial_seed(index)
+        sequence = np.random.SeedSequence([self._settings["seed"], index, member, 9])
+        return int(sequence.generate_state(1, dtype=np.uint64)[0])
+
+    def _screening_mode(self, index, n_training):
+        if n_training < self._screening.min_training_points:
+            return "bootstrap"
+        return "explore" if (index + 1) % self._screening.explore_every == 0 else "gp"
+
+    def _screen_candidate(self, index):
+        mode = self._screening_mode(index, len(self.training_rows))
+        requested = self._screening.pool_size if mode == "gp" else 1
+        details = dict(mode=mode, requested=requested, generated=0, selected_member=None,
+                       candidate_seed=None, mean=None, std=None, score=None)
+        candidates, features, members = [], [], []
+        error = None
+        for member in range(requested):
+            try:
+                candidate = self._generate(self._pool_seed(index, member))
+            except SlabGenerationError as exc:
+                error = str(exc)
+                continue
+            features.append(candidate_features(candidate, self.archive.fp_calc))
+            candidates.append(candidate)
+            members.append(member)
+        details["generated"] = len(candidates)
+        if not candidates:
+            return None, None, details, error
+        selected = 0
+        if mode == "gp":
+            selected, predictions = select_by_gp(features, self.training_rows, self._screening)
+            details.update(predictions[selected])
+        details.update(selected_member=members[selected],
+                       candidate_seed=self._pool_seed(index, members[selected]))
+        return candidates[selected], features[selected], details, None
+
     def _entry_metadata(self, outcome):
-        return dict(search_trial=outcome["trial"], trial_seed=outcome["seed"],
-                    calculator_id=self._settings["calculator_id"])
+        metadata = dict(search_trial=outcome["trial"], trial_seed=outcome["seed"],
+                        calculator_id=self._settings["calculator_id"])
+        if self._screening is not None:
+            metadata["candidate_seed"] = outcome["screening"]["candidate_seed"]
+        return metadata
 
     def save(self, path):
         """Atomically save the archive and all completed trials in one file."""
         self._check_archive()
-        _write_slab_json(path, dict(format="crisp-slab-search", version=1,
-                                   settings=self._settings, outcomes=self.outcomes,
-                                   archive=self.archive._to_payload()))
+        payload = dict(format="crisp-slab-search", version=1,
+                       settings=self._settings, outcomes=self.outcomes,
+                       archive=self.archive._to_payload())
+        if self._screening is not None:
+            payload.update(version=2, training=self.training_rows)
+        _write_slab_json(path, payload)
 
     def load(self, path):
         """Restore a compatible checkpoint without partial archive/progress updates."""
         target = self._check_archive()
         payload = _read_slab_json(path)
-        _check_fields(payload, {"format", "version", "settings", "outcomes", "archive"})
+        fields = {"format", "version", "settings", "outcomes", "archive"}
+        if self._screening is not None:
+            fields.add("training")
+        _check_fields(payload, fields)
+        version = 1 if self._screening is None else 2
         if (payload["format"] != "crisp-slab-search"
-                or type(payload["version"]) is not int or payload["version"] != 1):
+                or type(payload["version"]) is not int or payload["version"] != version):
             raise ValueError("Unsupported slab search checkpoint format/version")
         if payload["settings"] != self._settings:
             raise ValueError("Slab search settings/calculator_id do not match")
         outcomes = payload["outcomes"]
         if not isinstance(outcomes, list):
             raise ValueError("Slab search outcomes must be a list")
+        n_training = 0
         for index, outcome in enumerate(outcomes):
-            _check_fields(outcome, {"trial", "seed", "status", "reason", "energy_per_atom", "quench_steps"})
+            fields = {"trial", "seed", "status", "reason", "energy_per_atom", "quench_steps"}
+            if self._screening is not None:
+                fields.add("screening")
+            _check_fields(outcome, fields)
             if (type(outcome["trial"]) is not int or outcome["trial"] != index + 1
                     or type(outcome["seed"]) is not int or outcome["seed"] != self._trial_seed(index)
                     or not isinstance(outcome["status"], str)
@@ -188,6 +265,10 @@ class SlabRandomSearch:
                     raise ValueError("Slab search quench exceeds its step budget")
             elif outcome["energy_per_atom"] is not None or outcome["quench_steps"] is not None:
                 raise ValueError("Unrelaxed trial cannot contain quench results")
+            if self._screening is not None:
+                self._validate_screening(outcome, index, n_training)
+                n_training += outcome["status"] in ("accepted", "duplicate")
+        training = self._validated_training(payload["training"], outcomes) if self._screening else []
         target._load_payload(payload["archive"])
         accepted = [outcome for outcome in outcomes if outcome["status"] == "accepted"]
         if len(target.entries) != len(accepted) or any(
@@ -196,6 +277,59 @@ class SlabRandomSearch:
             raise ValueError("Slab search archive does not match its accepted trials")
         self.archive.entries = target.entries
         self.outcomes = deepcopy(outcomes)
+        self.training_rows = training
+
+    def _validate_screening(self, outcome, index, n_training):
+        details = outcome["screening"]
+        _check_fields(details, {"mode", "requested", "generated", "selected_member",
+                                "candidate_seed", "mean", "std", "score"})
+        mode = self._screening_mode(index, n_training)
+        requested = self._screening.pool_size if mode == "gp" else 1
+        if details["mode"] != mode or type(details["requested"]) is not int or details["requested"] != requested:
+            raise ValueError("Invalid slab GP selection mode/pool size")
+        _integer("generated", details["generated"], 0)
+        if details["generated"] > requested:
+            raise ValueError("Slab GP generation exceeded its pool budget")
+        if outcome["status"] == "generation_rejected":
+            if details["generated"] != 0 or any(details[key] is not None for key in
+                    ("selected_member", "candidate_seed", "mean", "std", "score")):
+                raise ValueError("Failed generation cannot contain a GP selection")
+            return
+        member = details["selected_member"]
+        _integer("selected_member", member, 0)
+        if (details["generated"] == 0 or member >= requested
+                or type(details["candidate_seed"]) is not int
+                or details["candidate_seed"] != self._pool_seed(index, member)):
+            raise ValueError("Invalid slab GP selected candidate")
+        if mode == "gp":
+            for name in ("mean", "std", "score"):
+                value = details[name]
+                if type(value) not in (int, float) or not np.isfinite(value):
+                    raise ValueError("Invalid slab GP prediction")
+            if details["std"] < 0 or not np.isclose(
+                    details["score"], details["mean"] - self._screening.kappa * details["std"],
+                    atol=1e-12, rtol=1e-12):
+                raise ValueError("Invalid slab GP acquisition score")
+        elif any(details[key] is not None for key in ("mean", "std", "score")):
+            raise ValueError("Random selections cannot contain GP predictions")
+
+    def _validated_training(self, rows, outcomes):
+        eligible = [outcome for outcome in outcomes if outcome["status"] in ("accepted", "duplicate")]
+        eligible = eligible[-self._screening.max_training_points:]
+        if not isinstance(rows, list) or len(rows) != len(eligible):
+            raise ValueError("Slab GP training rows do not match completed valid quenches")
+        dimension = 2 * self.archive.fp_calc.natx * (4 if self.archive.fp_calc.orbital == "sp" else 1)
+        restored = []
+        for row, outcome in zip(rows, eligible):
+            _check_fields(row, {"trial", "features", "energy_per_atom"})
+            if (type(row["trial"]) is not int or row["trial"] != outcome["trial"]
+                    or type(row["energy_per_atom"]) not in (int, float)
+                    or row["energy_per_atom"] != outcome["energy_per_atom"]):
+                raise ValueError("Slab GP training target does not match its completed trial")
+            feature = _real_array(row["features"], (dimension,))
+            restored.append(dict(trial=row["trial"], features=feature.tolist(),
+                                 energy_per_atom=float(row["energy_per_atom"])))
+        return restored
 
 
 def _integer(name, value, minimum):

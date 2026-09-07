@@ -1,10 +1,11 @@
 # 2D search
 
-`SlabRandomSearch` provides an opt-in, automated 2D random-search baseline using
+`SlabRandomSearch` provides an opt-in, automated 2D search using
 the slab geometry, fingerprints, generation, atomic quench, validation, and archive
 components below. It samples in-plane cells and relaxes atoms with each cell fixed.
-It does **not** add a 2D mode to `CRISPSearch`, GP screening, fingerprint-guided
-movement, or in-plane lattice relaxation. Original bulk modules and package
+Random search is the default; optional GP screening selects candidates before
+physical quench. This does **not** add a 2D mode to `CRISPSearch`, fingerprint-guided
+atomic movement, or in-plane lattice relaxation. Original bulk modules and package
 requirements are unchanged.
 
 ## Geometry contract
@@ -499,7 +500,7 @@ For use outside Python, export an entry through ASE, for example
 checking that the archive is nonempty. A separate `search.archive.save(path)`
 exports the plain archive without search progress.
 
-### Verified scope and remaining PRs
+### Verified random-search scope
 
 With Python 3.12, ASE 3.29.0, PyXtal 1.1.4 and the fingerprint revision above,
 the eight-trial Cu4/EMT example (seed 23) retained **7 distinct slabs and 1 duplicate**.
@@ -511,18 +512,142 @@ coordinates agreed within `2e-15` Angstrom and fingerprints within `1e-15`.
 This is a reproducible mechanics check, not evidence for copper-monolayer stability
 or recovery of the ground state of an unknown material.
 
-PR #8 is the first functioning **fixed-cell random search over sampled 2D cells**.
-The following small PRs should build on it, preserving bulk defaults:
+## GP candidate screening
+
+Pass `screening=SlabGPScreening()` to opt in to GP candidate selection. Omitting
+it preserves PR #8's candidate stream, outcomes, and version-1 checkpoints.
+The existing `ExactGP` implementation and original CRISP modules are unchanged.
+
+```python
+from crisp.slab_screening import SlabGPScreening
+
+gp_archive = SlabArchive(
+    SlabFingerprintCalculator(search_config, cutoff=3.2, natx=32), {"Cu": 4},
+    min_dist_ang=1.5,
+)
+gp_search = SlabRandomSearch(
+    gp_archive, EMT, calculator_id="ASE-EMT-default", seed=23,
+    layer_groups=[1, 2, 80], max_generation_attempts=6, fmax=0.05, max_steps=200,
+    screening=SlabGPScreening(pool_size=4, min_training_points=4, explore_every=5),
+)
+gp_search.run(12, checkpoint="slab-gp-search.json")
+```
+
+The first trials select the usual random candidate until enough valid quenches
+are available for training. Thereafter, GP trials generate up to `pool_size`
+candidates, compute their pooled fingerprints without physical calculations,
+and quench the candidate minimizing `predicted_mean - kappa * predicted_std`.
+Scores are in eV/atom; higher `kappa` favors uncertain candidates. Ties use pool
+order. Only physical post-quench energies determine archive insertion and ranking.
+
+Every `explore_every`-th trial bypasses GP selection and uses the first random
+candidate once bootstrap is complete. This deterministic interval counts all
+trials, including failures; `explore_every=1` keeps every trial random. Bootstrap
+and exploration generate one candidate. GP trials request `pool_size` candidates,
+each with its own `max_generation_attempts` cap, retain successful pool members
+when others exhaust generation, and reject the trial only if the pool is empty.
+There is still **at most one physical quench per trial**. Member zero retains
+the original trial seed; additional members use separate deterministic streams.
+
+Training pairs the **unrelaxed candidate's pooled fingerprint** with its valid
+post-quench energy. Relaxed archive fingerprints describe different geometries
+and are not substituted for these inputs. Both accepted and duplicate outcomes
+provide training rows; generation/quench/validation rejections do not. The most
+recent `max_training_points` valid rows are retained (default 128), bounding exact
+GP fitting cost. Duplicates count toward the bootstrap requirement even when
+several different starting structures converge to the same archived phase.
+
+The GP is rebuilt from these rows for each GP screening trial. It uses CRISP's
+RBF kernel, normalized targets, and existing deterministic hyperparameter tuning
+by default. `auto_tune=False` retains `length_scale=1.0` and `noise=1e-3` unless
+explicitly configured. The uncertainty is the surrogate's estimate, not a
+guarantee of prediction accuracy or physical stability. Poor descriptors or
+limited training data can make selection worse than random search.
+
+Outcomes include `screening` details: bootstrap/explore/gp mode, requested and
+generated pool sizes, selected member and candidate seed, and the selected GP
+mean, standard deviation, and score. A duplicate remains a `duplicate` outcome
+even when it adds a new training row. `training_rows` stores raw input features,
+trial numbers, and physical energy targets. Treat it as read-only along with
+archive entries and outcomes. Invalid descriptors, GP training/prediction errors,
+and nonfinite scores propagate before quench; no silent random fallback is used.
+
+### GP checkpoints and example
+
+Screening-enabled searches use **version-2** search checkpoints containing the
+same archive/progress information plus screening settings and the bounded raw
+training rows. The live GP object and inverse matrices are not serialized;
+deterministic retraining reconstructs them from saved data. Loading checks row
+dimensions and finite values, their correspondence to accepted/duplicate outcomes,
+selection modes/seeds, and archive consistency before replacing current state.
+
+Resume with the same screening settings, calculator label, actual energy model,
+and dependency versions. A version-1 random checkpoint cannot directly become a
+GP checkpoint because it lacks the original candidate descriptors. Random mode
+continues to read and write version 1. The executable example enables GP mode
+with one flag, which must also be supplied when resuming:
+
+```sh
+python examples/slab_random_search.py --gp --trials 5 --checkpoint cu-gp.json
+python examples/slab_random_search.py --gp --resume --trials 7 --checkpoint cu-gp.json
+```
+
+For comparisons, match **actual physical-quench requests**, force tolerance and
+step limits, and report generation/descriptor overhead separately. Equal trial
+counts imply equal quench counts only when generation succeeds. Screening spends
+extra cheap candidate work to choose which structure receives the costly quench;
+it does not guarantee fewer trials or a better result for every seed.
+
+### Equal-quench benchmark
+
+`examples/slab_gp_benchmark.py` reproduces a three-seed comparison using Cu4/EMT,
+the geometry above, `natx=64`, default GP settings, and **12 actual quench starts
+per arm**. Both arms use the same generation, force, and step settings. A cap of
+24 total trials prevents endless generation failures; incomplete arms raise
+instead of being presented as an equal-budget comparison.
+
+```sh
+python examples/slab_gp_benchmark.py --output cu-gp-benchmark.json
+```
+
+Observed with the same Python/ASE/PyXtal/fingerprint versions used above:
+
+| Seed | Random best E (eV/atom) | GP best E (eV/atom) | Random / GP distinct slabs | Random / GP EMT evaluations |
+| --- | --- | --- | --- | --- |
+| 17 | 0.7456202382 | 0.7456202382 | 6 / 7 | 557 / 625 |
+| 23 | 0.7524389956 | 0.7524389956 | 10 / 9 | 194 / 246 |
+| 31 | 0.7460499559 | 0.7819632169 | 9 / 9 | 519 / 431 |
+
+**This experiment does not demonstrate improved search efficiency.** GP tied
+twice and was worse by 0.0359132610 eV/atom on seed 31. Each GP run made six
+GP-ranked selections and selected nonzero pool members, so screening was active.
+GP requested 30 candidates versus 12; fingerprint calls were 40/42/41 versus
+10/12/10. These count generator requests (each bounded internally), not individual
+PyXtal attempts. No generation failures occurred in these runs. Physical EMT
+evaluations differ because quench lengths differ, despite equal quench starts.
+
+The independent seed-17 GP run split after five trials and resumed for seven
+reproduced outcomes and training rows exactly; archive energies matched, with
+coordinate/fingerprint differences below `9e-16`. The comparison verifies
+selection and restart mechanics, not ground-state recovery. Material-specific
+benchmarks and tuning are still needed before relying on GP screening for speed.
+
+Run `python -m unittest discover -s tests -p 'test_slab_*screen*.py' -v` and
+`python -m unittest discover -s tests -p 'test_slab_gp*.py' -v` for GP-specific checks.
+
+## Remaining PRs
+
+PR #8 provides functioning **fixed-cell random search over sampled 2D cells**;
+PR #9 adds optional GP selection. The next small PRs should preserve bulk defaults:
 
 | PR | Scope | Acceptance milestone |
 | --- | --- | --- |
-| 9 | Reuse `ExactGP` to screen candidates, retain exploration, and persist training state. | Compare GP screening with PR #8 at equal physical-quench budgets across several seeds. |
 | 10 | Add bounded atomic and in-plane cell mutations of archived parents. | Mutations preserve composition, c, physical PBC and bounds; random injection continues. |
 | 11 | Add fingerprint-guided atomic movement and final unbiased physical quench. | Real calculator energy alone ranks candidates; forces and slab bounds remain valid. |
 | 12 | Relax a/b and in-plane shear while keeping c and out-of-plane tilt fixed. | Verify in-plane derivatives/stress and results under changes in vacuum. |
 | 13 | Add target-material recovery benchmarks and documented operating settings. | Recover reference sheets across seeds, converge budgets, validate the energy model and compare with trusted relaxation results. |
 
-After #9 the driver is GP-assisted; after #11 it includes fingerprint-guided
+The driver is now optionally GP-assisted; after #11 it includes fingerprint-guided
 movement; after #12 it can optimize in-plane lattice parameters. Readiness for
 scientific predictions requires the material-specific evidence in #13, not only
 a completed PR count. HPC execution and more advanced finishers can follow.
