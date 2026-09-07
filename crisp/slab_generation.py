@@ -11,6 +11,10 @@ from ase.neighborlist import neighbor_list
 from .slab import SlabConfig, prepare_slab
 
 
+class SlabGenerationError(RuntimeError):
+    """A valid generation request exhausted its bounded attempts."""
+
+
 def _sample_cell(group, area, thickness, rng):
     """Sample a compatible in-plane metric, with no out-of-plane tilt."""
     gamma = np.pi / 2
@@ -126,6 +130,6 @@ def generate_slabs(composition: dict[str, int], config: SlabConfig, n: int, *,
         if len(structures) == n:
             return structures
 
-    raise RuntimeError(
+    raise SlabGenerationError(
         f"Generated {len(structures)}/{n} slabs after {max_attempts} attempts; "
         f"last rejection: {last_error}") from last_error

@@ -1,9 +1,11 @@
-# 2D search foundations
+# 2D search
 
-These opt-in helpers cover geometry, fingerprints, generation, atomic relaxation,
-structural validation, and a persistent archive for a future 2D search mode.
-They do **not** enable 2D searches in `CRISPSearch`. Existing bulk search behavior,
-imports, fingerprint code, relaxation, archives, and dependencies are unchanged.
+`SlabRandomSearch` provides an opt-in, automated 2D random-search baseline using
+the slab geometry, fingerprints, generation, atomic quench, validation, and archive
+components below. It samples in-plane cells and relaxes atoms with each cell fixed.
+It does **not** add a 2D mode to `CRISPSearch`, GP screening, fingerprint-guided
+movement, or in-plane lattice relaxation. Original bulk modules and package
+requirements are unchanged.
 
 ## Geometry contract
 
@@ -51,7 +53,8 @@ z boundary are not automatically repaired. A zero initial cell height is valid.
 allowed. These helpers do not establish 2D bonding/connectivity, minimum atomic
 separations, calculator compatibility, or safe fingerprint image clearance.
 The separate adapters below add distance, connectivity, and fingerprint clearance
-checks; calculator-specific checks and search integration belong to later PRs.
+checks. The local driver below connects them; physical calculator compatibility
+remains the caller's responsibility.
 
 Run the focused tests with `python -m unittest discover -s tests -p test_slab.py`.
 They use the existing base dependencies and need no optional fingerprint backend.
@@ -214,10 +217,10 @@ return a structure labeled as relaxed. Successful results record
 `slab_quench_steps` and `slab_quench_fmax` in `Atoms.info`.
 
 The slab configuration requires zero external pressure: energy per atom is the
-quantity available for later ranking, with no vacuum-dependent pressure-volume
+quantity used for ranking, with no vacuum-dependent pressure-volume
 term. Use the candidate validator below to check distances and connectivity after
 relaxation. In-plane cell optimization, material-specific energy checks,
-and search integration remain later work. A converged fixed-cell
+and integration with the full CRISP algorithm remain later work. A converged fixed-cell
 candidate is not yet a validated 2D material or a minimum with respect to in-plane
 strain.
 
@@ -392,9 +395,138 @@ the same physical energy model when adding further structures. The file records
 settings, not the calculator or a complete software environment.
 
 `save_checkpoint` and `load_checkpoint` still raise `NotImplementedError`:
-this PR restores archive contents, not search progress, GP state, or random-number
-state. The next step is a bounded local driver connecting generation, quench,
-validation, and archive insertion into a first automated 2D search.
+these archive methods restore archive contents, not search progress or GP state.
+Use the separate driver's `save`/`load` methods below for random-search progress.
 
 Run `python -m unittest discover -s tests -p 'test_slab_archive*.py' -v`.
 The archive tests pass with ASE 3.22.1 and 3.29.0, including real `s`/`sp` round trips.
+
+## Automated local random search
+
+`SlabRandomSearch` generates one candidate per trial, quenches all atomic xyz
+coordinates at fixed cell, checks distances and periodic connectivity, and inserts
+distinct candidates into `SlabArchive`. It ranks the physical energy per atom.
+Start with an empty archive, an explicit energy-model label, and a factory that
+returns a fresh ASE calculator. The factory must support mixed PBC and the target
+chemistry; energy and forces must be finite and real. No stress is requested.
+
+```python
+from crisp.slab_search import SlabRandomSearch
+
+search_config = SlabConfig(
+    area_per_atom_range=(4.5, 6.0), initial_thickness=1.0,
+    max_thickness=3.0, cell_height=18.0, min_vacuum=12.0,
+)
+search_archive = SlabArchive(
+    SlabFingerprintCalculator(search_config, cutoff=3.2, natx=32), {"Cu": 4},
+    min_dist_ang=1.5,
+)
+search = SlabRandomSearch(
+    search_archive, EMT, calculator_id="ASE-EMT-default", seed=23,
+    layer_groups=[1, 2, 80], max_generation_attempts=6, fmax=0.05, max_steps=200,
+)
+search.run(8, checkpoint="slab-search.json")
+print(search.completed_trials, search.counts)
+best_entries = search.archive.get_best(5)
+```
+
+`run(n_trials)` always means **additional trials**, including rejected candidates
+and duplicates. The archive may remain empty; inspect `counts` and `outcomes`
+instead of interpreting an exhausted budget as a successful material discovery.
+Every completed trial records a one-based trial number, its generation seed,
+status, rejection reason, and (after successful quench) energy and step count:
+
+| Status | Meaning |
+| --- | --- |
+| `accepted` | A converged, validated, distinct slab was inserted. |
+| `duplicate` | The existing fingerprint-plus-energy identity rule matched an entry. |
+| `generation_rejected` | The per-trial PyXtal attempt budget was exhausted. |
+| `quench_rejected` | Relaxation crossed slab geometry bounds or exhausted its step budget. |
+| `validation_rejected` | The converged candidate failed distance/connectivity checks. |
+
+Each trial makes at most one quench request, at most `max_generation_attempts`
+PyXtal calls, and at most `max_steps` optimizer moves. These are not limits on
+wall time or exact calculator evaluations. Zero trials makes no candidate or
+calculator calls; zero optimizer steps accepts only initially converged candidates.
+Worst-case allowed thickness must leave more than cutoff + `1e-6` Angstrom of
+empty z gap. Undersized fingerprint capacity remains a fatal configuration error.
+
+Expected rejections use narrow exception types in the opt-in generation/quench
+helpers; they retain the existing `ValueError`/`RuntimeError` inheritance.
+Invalid options, calculator errors/nonfinite results, unexpected generation errors,
+and descriptor or matcher failures propagate. They do not consume a trial or add
+an outcome. Earlier completed work remains available, so the failed trial can be
+retried after correcting the error. Logging uses `crisp.slab_search` at INFO level;
+callers can also inspect the full `outcomes` list directly.
+
+### Resume and output
+
+`search.save(path)` writes one atomic `crisp-slab-search`, version 1, JSON file
+containing search settings, all completed outcomes, and the validated archive
+format. Passing `checkpoint=path` to `run` saves after **every completed trial**,
+including rejections, so an interrupted run can resume at the next unsaved trial.
+A failed save preserves the previous file and keeps completed in-memory work;
+retry `save` to persist it. Optimizer steps within a trial are not checkpointed.
+
+Construct a new search with the same empty-archive and search settings, supply
+the same calculator factory, and call `load(path)` before continuing. For example,
+the executable demonstration provides the same setup in a fresh process:
+
+```sh
+# With CRISP, PyXtal 1.1.4 and the documented torch_fplib checkout importable:
+python examples/slab_random_search.py --trials 3 --checkpoint cu-search.json
+python examples/slab_random_search.py --resume --trials 5 --checkpoint cu-search.json
+```
+
+The second command adds five trials, for eight total. The example refuses to
+overwrite an existing checkpoint unless `--resume` is selected. In the Python
+API, `save` and the `checkpoint` argument replace their explicitly supplied path;
+they do not automatically load it.
+
+Search and archive settings, including `calculator_id`, must match on load.
+The label is provenance, not proof of identical model weights or parameters;
+use the same actual model and dependency versions. Trial seeds derive from the
+run seed and trial index using local NumPy `SeedSequence` with 64-bit output.
+The driver does not consume global RNG state. With deterministic generation and
+calculators, split/resumed runs reproduce outcomes; re-centering/wrapping while
+loading can introduce roundoff in saved coordinates/descriptors. A malformed,
+inconsistent, incompatible, or backend-failing load leaves both current archive
+and progress intact. Bulk and plain archive files are not search checkpoints.
+
+The checkpoint stores structures accessible through `search.archive.entries`.
+For use outside Python, export an entry through ASE, for example
+`ase.io.write("best-slab.extxyz", search.archive.get_best(1)[0].atoms)` after
+checking that the archive is nonempty. A separate `search.archive.save(path)`
+exports the plain archive without search progress.
+
+### Verified scope and remaining PRs
+
+With Python 3.12, ASE 3.29.0, PyXtal 1.1.4 and the fingerprint revision above,
+the eight-trial Cu4/EMT example (seed 23) retained **7 distinct slabs and 1 duplicate**.
+Quenches took `[0, 23, 13, 29, 40, 15, 0, 0]` steps. Trial 5 reduced energy from
+1.703644 to 0.778408 eV/atom with 0.817374 Angstrom maximum atomic displacement.
+All retained slabs passed validation and preserved their exact sampled cells.
+Three trials plus reload/resume for five matched uninterrupted outcomes exactly;
+coordinates agreed within `2e-15` Angstrom and fingerprints within `1e-15`.
+This is a reproducible mechanics check, not evidence for copper-monolayer stability
+or recovery of the ground state of an unknown material.
+
+PR #8 is the first functioning **fixed-cell random search over sampled 2D cells**.
+The following small PRs should build on it, preserving bulk defaults:
+
+| PR | Scope | Acceptance milestone |
+| --- | --- | --- |
+| 9 | Reuse `ExactGP` to screen candidates, retain exploration, and persist training state. | Compare GP screening with PR #8 at equal physical-quench budgets across several seeds. |
+| 10 | Add bounded atomic and in-plane cell mutations of archived parents. | Mutations preserve composition, c, physical PBC and bounds; random injection continues. |
+| 11 | Add fingerprint-guided atomic movement and final unbiased physical quench. | Real calculator energy alone ranks candidates; forces and slab bounds remain valid. |
+| 12 | Relax a/b and in-plane shear while keeping c and out-of-plane tilt fixed. | Verify in-plane derivatives/stress and results under changes in vacuum. |
+| 13 | Add target-material recovery benchmarks and documented operating settings. | Recover reference sheets across seeds, converge budgets, validate the energy model and compare with trusted relaxation results. |
+
+After #9 the driver is GP-assisted; after #11 it includes fingerprint-guided
+movement; after #12 it can optimize in-plane lattice parameters. Readiness for
+scientific predictions requires the material-specific evidence in #13, not only
+a completed PR count. HPC execution and more advanced finishers can follow.
+
+Run `python -m unittest discover -s tests -p 'test_slab_search*.py' -v`.
+The real end-to-end test needs PyXtal and `torch_fplib`; lightweight control-flow
+and harmonic-relaxation tests run without those optional backends.
