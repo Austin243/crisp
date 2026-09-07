@@ -12,6 +12,7 @@ from ase.calculators.emt import EMT
 from crisp.slab import SlabConfig
 from crisp.slab_archive import SlabArchive
 from crisp.slab_fingerprint import SlabFingerprintCalculator
+from crisp.slab_mutation import SlabMutations
 from crisp.slab_screening import SlabGPScreening
 from crisp.slab_search import SlabRandomSearch
 
@@ -23,6 +24,7 @@ def main():
     parser.add_argument("--checkpoint", type=Path, default=Path("slab-search.json"))
     parser.add_argument("--resume", action="store_true", help="load the checkpoint before continuing")
     parser.add_argument("--gp", action="store_true", help="enable GP screening after random bootstrap")
+    parser.add_argument("--mutations", action="store_true", help="perturb archived parents between random trials")
     args = parser.parse_args()
     if args.trials < 0 or args.seed < 0:
         parser.error("trials and seed must be nonnegative")
@@ -41,6 +43,7 @@ def main():
         archive, EMT, calculator_id="ASE-EMT-default", seed=args.seed,
         layer_groups=[1, 2, 80], max_generation_attempts=6, fmax=0.05, max_steps=200,
         screening=SlabGPScreening() if args.gp else None,
+        mutations=SlabMutations() if args.mutations else None,
     )
     if args.resume:
         search.load(args.checkpoint)
