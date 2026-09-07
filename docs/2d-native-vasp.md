@@ -4,10 +4,12 @@
 steps and permitted cell optimization internally; no ASE optimizer drives it.
 The original bulk CRISP and HPC backends are unchanged.
 
-This draft has synthetic-output/parser and local process tests. **It has not
-been run against a licensed VASP executable.** The real-build acceptance checks
-below remain a merge/readiness gate. Passing unit tests does not establish that
-a particular VASP build relaxes every permitted slab metric correctly.
+This experimental backend has synthetic-output/parser and local process tests.
+**It has not been run against a licensed VASP executable.** Integration into
+`feature/2d-search` makes it available for development and validation. The
+real-build acceptance checks below remain required before relying on scientific
+results. Passing unit tests does not establish that a particular VASP build
+relaxes every permitted slab metric correctly.
 
 ## Supported geometry and build
 
@@ -174,7 +176,7 @@ restart files are not carried between recipes.
 
 ## Real-build acceptance still required
 
-Before merging this draft as a validated VASP backend:
+Before treating this backend as scientifically validated:
 
 1. Relax a known flat sheet and a finite-thickness sheet with the actual
    supported executable, explicit potentials and a converged final recipe.
