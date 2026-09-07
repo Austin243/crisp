@@ -10,6 +10,7 @@ from ase.calculators.emt import EMT
 from crisp.slab import SlabConfig
 from crisp.slab_archive import SlabArchive
 from crisp.slab_fingerprint import SlabFingerprintCalculator
+from crisp.slab_screening import SlabGPScreening
 from crisp.slab_search import SlabRandomSearch
 
 try:
@@ -23,7 +24,7 @@ except ImportError:
     torch_fplib = None
 
 
-def _search():
+def _search(screening=None):
     config = SlabConfig((5.5, 6.5), initial_thickness=0, max_thickness=1,
                         cell_height=18, min_vacuum=12)
     archive = SlabArchive(
@@ -33,6 +34,7 @@ def _search():
     return SlabRandomSearch(
         archive, EMT, calculator_id="ASE-EMT-default", seed=19,
         layer_groups=[80], max_generation_attempts=6, max_steps=0,
+        screening=screening,
     )
 
 
@@ -40,16 +42,25 @@ def _search():
                      "PyXtal and torch_fplib required")
 class TestSlabSearchBackend(unittest.TestCase):
     def test_real_seeded_search_matches_split_checkpoint_resume(self):
+        self._check_split_checkpoint_resume()
+
+    def test_real_gp_search_matches_split_checkpoint_resume(self):
+        self._check_split_checkpoint_resume(SlabGPScreening(
+            pool_size=3, min_training_points=2, explore_every=4,
+            max_training_points=4,
+        ))
+
+    def _check_split_checkpoint_resume(self, screening=None):
         # A one-atom triangular sheet has zero forces by symmetry. This tests
         # the complete pipeline and restart, not structural stability/recovery.
         state = np.random.get_state()
-        continuous = _search()
+        continuous = _search(screening)
         continuous.run(6)
         with tempfile.TemporaryDirectory() as directory:
             checkpoint = Path(directory) / "search.json"
-            first = _search()
+            first = _search(screening)
             first.run(2, checkpoint=checkpoint)
-            resumed = _search()
+            resumed = _search(screening)
             resumed.load(checkpoint)
             self.assertEqual(resumed.completed_trials, 2)
             resumed.run(4, checkpoint=checkpoint)
@@ -61,6 +72,12 @@ class TestSlabSearchBackend(unittest.TestCase):
         self.assertEqual(continuous.counts, resumed.counts)
         self.assertTrue(all(outcome["status"] in ("accepted", "duplicate")
                             for outcome in continuous.outcomes))
+        self.assertEqual(continuous.training_rows, resumed.training_rows)
+        if screening is not None:
+            self.assertEqual([outcome["screening"]["mode"] for outcome in continuous.outcomes],
+                             ["bootstrap", "bootstrap", "gp", "explore", "gp", "gp"])
+            self.assertEqual(len(continuous.training_rows), 4)
+            self.assertEqual([row["trial"] for row in continuous.training_rows], [3, 4, 5, 6])
         self.assertEqual(len(continuous.archive.entries), len(resumed.archive.entries))
         for expected, actual in zip(continuous.archive.entries, resumed.archive.entries):
             self.assertEqual(expected.energy, actual.energy)
