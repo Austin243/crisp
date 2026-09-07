@@ -158,6 +158,33 @@ def test_settings_ownership_and_no_work_path_identity(native, tmp_path):
     assert other.settings == relaxer.settings
 
 
+def test_replacing_acceptance_config_cannot_reclassify_a_cached_result(native):
+    relaxer, atoms = native
+    with patch.object(relaxer, "_execute", side_effect=lambda path: output(relaxer, path, stress=2)) as execute:
+        for _ in range(2):
+            with pytest.raises(VASPValidationError, match="not converged"):
+                relaxer.relax(atoms, "stress-rejected")
+        relaxer.config = replace(relaxer.config, stress_tolerance=.1)
+        with pytest.raises(ValueError, match="construct a new backend"):
+            relaxer.relax(atoms, "stress-rejected")
+        with pytest.raises(ValueError, match="construct a new backend"):
+            _ = relaxer.settings
+    assert execute.call_count == 1
+
+
+def test_nested_command_mutation_fails_before_execution_or_identity_access(native):
+    original, atoms = native
+    relaxer = SlabVASPRelaxer(original.spec, replace(original.config, command=["vasp_std"]), original.work_dir)
+    relaxer.config.command[0] = "other-executable"
+    with patch.object(relaxer, "_execute") as execute:
+        with pytest.raises(ValueError, match="construct a new backend"):
+            _ = relaxer.settings
+        with pytest.raises(ValueError, match="construct a new backend"):
+            relaxer.relax(atoms, "changed-command")
+    execute.assert_not_called()
+    assert not relaxer.work_dir.exists()
+
+
 @pytest.mark.parametrize("change", [
     {"version": "6.4.3"}, {"version": "6"}, {"command": "srun vasp_std"},
     {"command": ()}, {"kpoints": (3, 3, 2)}, {"force_tolerance": 0},
@@ -173,6 +200,87 @@ def test_invalid_configuration_fails_before_execution(native, change):
     relaxer, _ = native
     with pytest.raises((ValueError, TypeError)):
         SlabVASPRelaxer(relaxer.spec, replace(relaxer.config, **change), relaxer.work_dir)
+
+
+@pytest.mark.parametrize("tag,value", [
+    ("IBRION", True), ("IBRION", 1.0), ("ISIF", 3.0),
+    ("ISYM", False), ("ISYM", 0.0), ("ISTART", False),
+    ("ICHARG", 2.0), ("NWRITE", 2.0), ("PSTRESS", False),
+    ("PSTRESS", 0j), ("LATTICE_CONSTRAINTS", [1, 1, 0]),
+    ("LATTICE_CONSTRAINTS", [True, True, 0.0]),
+])
+def test_protected_controls_require_vasp_compatible_literal_types(native, tag, value):
+    relaxer, _ = native
+    config = replace(relaxer.config, incar={"ENCUT": 520, tag: value})
+    with pytest.raises(ValueError, match=tag):
+        SlabVASPRelaxer(relaxer.spec, config, relaxer.work_dir)
+    assert not relaxer.work_dir.exists()
+
+
+def test_protected_controls_accept_numpy_integer_and_logical_values(native):
+    relaxer, atoms = native
+    config = replace(relaxer.config, incar={
+        "ENCUT": 520, "IBRION": np.int64(1), "ISIF": np.int64(3),
+        "ISYM": np.int64(0), "ISTART": np.int64(0), "ICHARG": np.int64(2),
+        "NWRITE": np.int64(2), "PSTRESS": np.float64(0),
+        "LATTICE_CONSTRAINTS": [np.bool_(True), np.bool_(True), np.bool_(False)],
+    })
+    relaxer = SlabVASPRelaxer(relaxer.spec, config, relaxer.work_dir)
+    with patch.object(relaxer, "_execute", side_effect=lambda path: output(relaxer, path)):
+        relaxer.relax(atoms, "typed-controls")
+    text = (relaxer.work_dir / "typed-controls/stage-00/INCAR").read_text()
+    assert "IBRION = 1\n" in text
+    assert "ISYM = 0\n" in text
+    assert "LATTICE_CONSTRAINTS = .TRUE. .TRUE. .FALSE.\n" in text
+
+
+@pytest.mark.parametrize("tag", ["VDW_C6", "VDW_C6AU", "VDW_R0", "VDW_R0AU",
+                                 "VDW_ALPHA", "ROPT", "RWIGS"])
+@pytest.mark.parametrize("value", [[1.0, 2.0], "1.0 2.0", "2*1.0"])
+def test_species_vectors_are_rejected_until_their_order_can_be_mapped(native, tag, value):
+    relaxer, _ = native
+    config = replace(relaxer.config, incar={"ENCUT": 520, tag: value})
+    with pytest.raises(ValueError, match=tag):
+        SlabVASPRelaxer(relaxer.spec, config, relaxer.work_dir)
+    assert not relaxer.work_dir.exists()
+
+
+@pytest.mark.parametrize("echo,expected,matches", [
+    ("0.03333333", 1 / 30, True), ("0.03333334", 1 / 30, False),
+    ("0.00000000", 5e-9, True), ("0.00000001", 5e-9, True),
+    ("0.00000002", 5e-9, False), ("3.3333333D-02", 1 / 30, True),
+    ("3.3333334E-02", 1 / 30, False), (".001", .001, True),
+    ("5E2", 520.0, False), ("5.0E2", 520.0, False), ("0.03", 1 / 30, False),
+    (".001", 1, False), ("2.00000000", 2, True),
+    ("2.00000001", 2, False), ("2", 2.1, False),
+    ("T T F", [True, True, False], True),
+    ("1 1 0", [True, True, False], False), ("Accurate", "accurate", True),
+    (".LABEL.", "LABEL", False), ("NaN", float("nan"), False),
+    ("Inf", "Inf", False), ("-Infinity", "-Infinity", False),
+])
+def test_native_echo_uses_printed_precision_without_loosening_integer_controls(echo, expected, matches):
+    if isinstance(expected, float) and not np.isfinite(expected):
+        # The formatter rejects nonfinite inputs independently of output matching.
+        with pytest.raises(ValueError):
+            SlabVASPRelaxer._same_value(echo, expected)
+    else:
+        assert SlabVASPRelaxer._same_value(echo, expected) is matches
+
+
+@pytest.mark.parametrize("rounded_ediff", ["0.00000000", "0.00000001"])
+def test_complete_native_results_accept_eight_decimal_incar_echoes(native, rounded_ediff):
+    relaxer, atoms = native
+    config = replace(relaxer.config, incar={"ENCUT": 520, "SIGMA": 1 / 30, "EDIFF": 5e-9})
+    relaxer = SlabVASPRelaxer(relaxer.spec, config, relaxer.work_dir)
+    def run(path):
+        def rounded(root):
+            root.find("incar/i[@name='SIGMA']").text = "0.03333333"
+            root.find("incar/i[@name='EDIFF']").text = rounded_ediff
+        output(relaxer, path, mutate_xml=rounded)
+    with patch.object(relaxer, "_execute", side_effect=run):
+        result = relaxer.relax(atoms, "rounded")
+    assert result.metadata["converged"]
+    assert relaxer.settings["stages"][-1]["incar"]["EDIFF"] == 5e-9
 
 
 @pytest.mark.parametrize("kwargs", [

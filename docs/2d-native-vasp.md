@@ -89,6 +89,13 @@ This limitation matters for magnetic or correlated target chemistry. It does
 not claim a general VASP input wrapper. Scalar physical settings such as XC,
 smearing and van der Waals choices remain part of the explicit recipe identity.
 
+Species-ordered `VDW_C6`, `VDW_C6AU`, `VDW_R0`, `VDW_R0AU`, `VDW_ALPHA`,
+`ROPT` and `RWIGS` overrides are also rejected until an explicit mapping API is
+available. This prevents sorting POSCAR/POTCAR from changing which species receives
+a value. See the VASP definitions of [VDW_C6](https://vasp.at/wiki/VDW_C6),
+[VDW_R0](https://vasp.at/wiki/VDW_R0), [ROPT](https://vasp.at/wiki/ROPT), and
+[RWIGS](https://vasp.at/wiki/RWIGS). Scalar choices such as `IVDW` remain supported.
+
 ## Acceptance, energy convention and failures
 
 Collection first requires a complete XML document, a normal OUTCAR footer,
@@ -100,6 +107,14 @@ independent force and in-plane stress thresholds. An energy-change-only ionic
 criterion is not accepted. The relevant VASP definitions are
 [EDIFF](https://vasp.at/wiki/EDIFF) and
 [EDIFFG](https://vasp.at/wiki/EDIFFG).
+
+Numeric INCAR echoes are compared at their printed precision, including VASP's
+eight-decimal real output; rounding tolerance requires at least eight decimal
+places or significant digits. Integer controls and logical values remain exact.
+Input hashes still require the actual prepared files to remain unchanged.
+Construct a new backend to change its configuration; replacing settings or
+mutating nested options on an existing backend is rejected before execution or
+cache reuse. This also protects the recorded identity of its acceptance criteria.
 
 ASE parses native XML and converts VASP kbar stress to ASE eV/Angstrom³ with the
 ASE sign convention. The acceptance magnitude uses xx, yy and xy times fixed

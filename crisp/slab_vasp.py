@@ -5,10 +5,11 @@ execution and result validation; it never runs an ASE optimizer.
 """
 
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from decimal import Decimal, DecimalException
 import hashlib
 import json
-from numbers import Integral
+from numbers import Integral, Real
 import os
 from pathlib import Path
 import re
@@ -176,10 +177,20 @@ class SlabVASPRelaxer:
             "energy": "ASE VASP XML zero-smearing corrected energy per atom",
         }
         self._settings = json.loads(_json(self._settings))
+        self._config_snapshot = _json(asdict(self.config))
+
+    def _check_config(self):
+        try:
+            unchanged = _json(asdict(self.config)) == self._config_snapshot
+        except (TypeError, ValueError):
+            unchanged = False
+        if not unchanged:
+            raise ValueError("Native VASP configuration changed; construct a new backend")
 
     @property
     def settings(self):
         """A detached serializable identity, excluding paths and wall-clock limits."""
+        self._check_config()
         return deepcopy(self._settings)
 
     def _recipe(self, supplied, *, final):
@@ -192,7 +203,9 @@ class SlabVASPRelaxer:
         forbidden = {"KSPACING", "KGAMMA", "IMAGES", "SPRING", "LCLIMB", "IOPT",
                      "ICONST", "MDALGO", "LCHAIN", "EFIELD", "EFIELD_PEAD", "DIPOL",
                      "MAGMOM", "M_CONSTR", "LNONCOLLINEAR", "LSORBIT", "LAMBDA",
-                     "LDAU", "LDAUTYPE", "LDAUL", "LDAUU", "LDAUJ"}
+                     "LDAU", "LDAUTYPE", "LDAUL", "LDAUU", "LDAUJ",
+                     "VDW_C6", "VDW_C6AU", "VDW_R0", "VDW_R0AU", "VDW_ALPHA",
+                     "ROPT", "RWIGS"}
         # Per-atom/species vectors need an explicit mapping API before support.
         if forbidden.intersection(supplied):
             raise ValueError(f"Unsupported mapped or competing INCAR tags: {sorted(forbidden.intersection(supplied))}")
@@ -202,12 +215,21 @@ class SlabVASPRelaxer:
                   "LATTICE_CONSTRAINTS": [True, True, False], "ISTART": 0,
                   "ICHARG": 2, "NWRITE": 2, "LWAVE": False, "LCHARG": False,
                   **supplied}
+        for key in ("IBRION", "ISIF", "ISYM", "ISTART", "ICHARG", "NWRITE"):
+            if isinstance(recipe[key], (bool, np.bool_)) or not isinstance(recipe[key], Integral):
+                raise ValueError(f"{key} must be an integer, not a logical or floating-point value")
         if recipe["IBRION"] not in (1, 2) or recipe["ISIF"] not in ((3,) if final else (2, 3)):
             raise ValueError("Native relaxation requires IBRION=1/2 and final ISIF=3")
+        if (isinstance(recipe["PSTRESS"], (bool, np.bool_))
+                or not isinstance(recipe["PSTRESS"], Real) or not np.isfinite(recipe["PSTRESS"])):
+            raise ValueError("PSTRESS must be a finite real number")
         fixed = {"PSTRESS": 0, "ISYM": 0, "ISTART": 0, "ICHARG": 2, "NWRITE": 2}
         if any(recipe[k] != v for k, v in fixed.items()):
             raise ValueError("PSTRESS=0, ISYM=0, ISTART=0, ICHARG=2 and NWRITE=2 are required")
-        if not isinstance(recipe["LATTICE_CONSTRAINTS"], (tuple, list)) or list(recipe["LATTICE_CONSTRAINTS"]) != [True, True, False]:
+        constraints = recipe["LATTICE_CONSTRAINTS"]
+        if (not isinstance(constraints, (tuple, list))
+                or any(not isinstance(value, (bool, np.bool_)) for value in constraints)
+                or list(constraints) != [True, True, False]):
             raise ValueError("LATTICE_CONSTRAINTS must be [True, True, False]")
         for name in ("NSW", "NELM"):
             if isinstance(recipe[name], bool) or not isinstance(recipe[name], Integral) or recipe[name] < 1:
@@ -223,6 +245,7 @@ class SlabVASPRelaxer:
 
     def relax(self, atoms, candidate_id):
         """Return a validated result; preserve input order, arrays and provenance."""
+        self._check_config()
         if not isinstance(candidate_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", candidate_id):
             raise ValueError("candidate_id must be a simple nonempty directory name")
         if atoms.constraints:
@@ -449,15 +472,38 @@ class SlabVASPRelaxer:
     @staticmethod
     def _same_value(text, expected):
         def tokens(value):
-            return [part.upper().strip(".") for part in str(value).split()]
+            return str(value).upper().split()
         left, right = tokens(text), tokens(_incar_value(expected))
-        if left == right:
-            return True
-        logical = {"T": "TRUE", "F": "FALSE"}
-        if [logical.get(x, x) for x in left] == [logical.get(x, x) for x in right]:
-            return True
-        try:
-            return len(left) == len(right) and bool(np.allclose([float(x.replace("D", "E")) for x in left],
-                                                               [float(x.replace("D", "E")) for x in right], rtol=1e-9, atol=1e-12))
-        except ValueError:
+        if len(left) != len(right):
             return False
+        logical = {value: truth for truth in ("TRUE", "FALSE")
+                   for value in (truth, truth[0], f".{truth}.", f".{truth[0]}.")}
+        if any(value in logical for value in right):
+            return ([logical.get(value, value) for value in left]
+                    == [logical.get(value, value) for value in right])
+        values = expected if isinstance(expected, (tuple, list)) else [expected]
+        integer_input = all(isinstance(value, Integral) and not isinstance(value, (bool, np.bool_))
+                            for value in values)
+        try:
+            for observed, requested in zip(left, right):
+                actual, wanted = Decimal(observed.replace("D", "E")), Decimal(requested.replace("D", "E"))
+                if not actual.is_finite() or not wanted.is_finite():
+                    return False
+                if actual == wanted:
+                    continue
+                if integer_input or not any(char in observed for char in ".ED"):
+                    return False
+                mantissa = observed.replace("D", "E").split("E")[0]
+                if len(mantissa.partition(".")[2]) < 8 and len(actual.as_tuple().digits) < 8:
+                    return False
+                # VASP commonly prints INCAR reals with eight decimal places.
+                # Compare within half its final printed digit, not a relative
+                # tolerance that rejects legitimate rounded native echoes. Do
+                # not infer precision from coarse strings such as "5E2".
+                half_quantum = Decimal(1).scaleb(actual.as_tuple().exponent) / 2
+                roundoff = Decimal("2e-15") * max(abs(actual), abs(wanted))
+                if abs(actual - wanted) > half_quantum + roundoff:
+                    return False
+            return True
+        except DecimalException:
+            return left == right
