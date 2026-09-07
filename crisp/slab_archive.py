@@ -87,8 +87,7 @@ class SlabArchive(StructureArchive):
             raise ValueError("Slab composition and atom count must match the archive")
         config = self._fp_settings[0]
         # Reject invalid inputs before prepare_slab could repair PBC or height.
-        validate_slab_candidate(atoms, config, min_dist_ang=self.min_dist_ang,
-                                bond_scale=self.bond_scale)
+        self._validate_candidate(atoms)
         stored = prepare_slab(atoms, config)
         stored = stored[np.argsort(stored.numbers, kind="stable")]
         stored.info = deepcopy(atoms.info)
@@ -120,6 +119,12 @@ class SlabArchive(StructureArchive):
             enthalpy=energy, pressure=0.0, metadata=meta,
             generation=meta.get("generation", 0)))
         return True
+
+    def _validate_candidate(self, atoms):
+        """Geometry policy hook for additive slab archive specializations."""
+        validate_slab_candidate(atoms, self._fp_settings[0],
+                                min_dist_ang=self.min_dist_ang,
+                                bond_scale=self.bond_scale)
 
     def _persistence_target(self):
         """Validate current settings and create an empty compatible archive."""
