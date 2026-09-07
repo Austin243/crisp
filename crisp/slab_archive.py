@@ -1,11 +1,17 @@
 """Opt-in, fixed-composition slab archive with species-aware identity."""
 
 from copy import deepcopy
+from dataclasses import asdict
+import json
 from numbers import Integral
+import os
+from pathlib import Path
+import tempfile
 
 import numpy as np
 from ase import Atoms
-from ase.data import atomic_numbers
+from ase.data import atomic_numbers, chemical_symbols
+from ase.io.jsonio import MyEncoder as ASEJSONEncoder, object_hook as ase_object_hook
 
 from .archive import ArchiveEntry, StructureArchive
 from .slab import prepare_slab
@@ -23,8 +29,8 @@ class SlabArchive(StructureArchive):
     thresholds. This finite-cutoff comparison is approximate phase identity.
 
     Ranking, diversity selection, and feature/energy accessors are inherited.
-    Treat exposed entries and cached arrays as read-only. Persistence is not
-    supported until a slab-specific checkpoint contract is implemented.
+    Treat exposed entries and cached arrays as read-only. Save/load use a
+    separate, versioned slab format; search checkpoints are not supported.
     """
 
     def __init__(self, fp_calc: SlabFingerprintCalculator, composition: dict[str, int], *,
@@ -115,7 +121,174 @@ class SlabArchive(StructureArchive):
             generation=meta.get("generation", 0)))
         return True
 
-    def _unsupported_persistence(self, *args, **kwargs):
-        raise NotImplementedError("Slab archive persistence requires a slab-specific checkpoint contract")
+    def _persistence_target(self):
+        """Validate current settings and create an empty compatible archive."""
+        if self._fingerprint_settings() != self._fp_settings:
+            raise ValueError("Slab archive geometry/fingerprint settings changed; create a new archive")
+        numbers, counts = np.unique(self._numbers, return_counts=True)
+        composition = {chemical_symbols[number]: int(count)
+                       for number, count in zip(numbers, counts)}
+        options = dict(min_dist_ang=self.min_dist_ang, bond_scale=self.bond_scale,
+                       fp_threshold=self.fp_threshold, energy_threshold=self.energy_threshold)
+        target = SlabArchive(self.fp_calc, composition, **options)
+        settings = dict(slab=asdict(self.fp_calc.config), composition=composition,
+                        fingerprint=dict(cutoff=self.fp_calc.cutoff, natx=int(self.fp_calc.natx),
+                                         orbital=self.fp_calc.orbital), **options)
+        # Normalize tuples and NumPy scalar settings to their JSON representation.
+        settings = json.loads(json.dumps(settings, default=_slab_json_default, allow_nan=False))
+        return target, settings
 
-    save = load = save_checkpoint = load_checkpoint = _unsupported_persistence
+    def save(self, path: str | Path) -> None:
+        """Atomically write a slab archive JSON file, without evaluating a calculator.
+
+        Entries are read-only by convention; fingerprints are not saved or
+        recomputed here. Keep validation/duplicate settings fixed while populated.
+        Metadata and Atoms.info must contain finite JSON values with string keys;
+        tuples become lists. Ordinary ASE arrays and constraints are preserved.
+        """
+        _, settings = self._persistence_target()
+        records = []
+        for entry in self.entries:
+            atoms = entry.atoms.todict()
+            info = atoms.pop("info", {})
+            _check_json_value(info)
+            _check_json_value(entry.metadata)
+            _check_json_value(entry.generation)
+            if any(array.dtype.kind not in "biufcU" for array in entry.atoms.arrays.values()):
+                raise TypeError("Slab archive atom arrays must be numeric, boolean or Unicode")
+            records.append(dict(atoms=atoms, info=info, energy_per_atom=entry.energy,
+                                metadata=entry.metadata, generation=entry.generation))
+        payload = json.dumps(dict(format="crisp-slab-archive", version=1,
+                                  settings=settings, entries=records),
+                             default=_slab_json_default, allow_nan=False, indent=2)
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                             prefix=f".{path.name}.", suffix=".tmp",
+                                             delete=False) as stream:
+                temporary = Path(stream.name)
+                stream.write(payload + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            temporary.replace(path)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+    def load(self, path: str | Path) -> None:
+        """Replace entries only after a compatible file fully validates.
+
+        Recompute fingerprints through add(), preserving saved insertion order.
+        Invalid or duplicate records and backend errors leave this archive intact.
+        This restores archive contents, not calculator, GP, RNG, or search state.
+        """
+        target, settings = self._persistence_target()
+        payload = json.loads(Path(path).read_text(encoding="utf-8"),
+                             parse_constant=_invalid_json_constant,
+                             object_pairs_hook=_unique_json_fields)
+        _check_fields(payload, {"format", "version", "settings", "entries"})
+        if (payload["format"] != "crisp-slab-archive"
+                or type(payload["version"]) is not int or payload["version"] != 1):
+            raise ValueError("Unsupported slab archive format/version")
+        if payload["settings"] != settings:
+            raise ValueError("Slab archive settings do not match the destination archive")
+        if not isinstance(payload["entries"], list):
+            raise ValueError("Slab archive entries must be a list")
+        for record in payload["entries"]:
+            _check_fields(record, {"atoms", "info", "energy_per_atom", "metadata", "generation"})
+            if (not isinstance(record["atoms"], dict) or "info" in record["atoms"]
+                    or not isinstance(record["info"], dict)
+                    or not isinstance(record["metadata"], dict)):
+                raise ValueError("Invalid slab archive atoms/info/metadata record")
+            for name in ("info", "metadata", "generation"):
+                _check_json_value(record[name])
+            # Decode only structural ASE data: user metadata keys must stay literal.
+            atom_data = json.loads(json.dumps(record["atoms"]), object_hook=_slab_object_hook)
+            # ASE otherwise silently casts fractional species, truthy PBC or complex positions.
+            for name, kinds, shape in (("numbers", "iu", (len(self._numbers),)),
+                                       ("pbc", "b", (3,)),
+                                       ("positions", "f", (len(self._numbers), 3)),
+                                       ("cell", "f", (3, 3))):
+                value = atom_data.get(name)
+                if (not isinstance(value, np.ndarray) or value.dtype.kind not in kinds
+                        or value.shape != shape):
+                    raise ValueError(f"Invalid slab archive atom field: {name}")
+            atoms = Atoms.fromdict(atom_data)
+            if any(array.dtype.kind not in "biufcU" for array in atoms.arrays.values()):
+                raise TypeError("Slab archive atom arrays must be numeric, boolean or Unicode")
+            atoms.info = record["info"]
+            if not target.add(atoms, record["energy_per_atom"], metadata=record["metadata"]):
+                raise ValueError("Slab archive contains duplicate entries")
+            target.entries[-1].generation = record["generation"]
+        self.entries = target.entries
+
+    def _unsupported_checkpoint(self, *args, **kwargs):
+        raise NotImplementedError("Slab search checkpoints require a separate GP/RNG/search-state contract")
+
+    save_checkpoint = load_checkpoint = _unsupported_checkpoint
+
+
+def _check_json_value(value):
+    """Reject lossy key coercion and unsupported objects in user metadata."""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError("Slab archive metadata keys must be strings")
+            _check_json_value(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _check_json_value(item)
+    elif value is not None and not isinstance(value, (str, bool, int, float)):
+        raise TypeError("Slab archive metadata must contain JSON-compatible values")
+    elif isinstance(value, float) and not np.isfinite(value):
+        raise ValueError("Slab archive metadata numbers must be finite")
+
+
+def _check_fields(value, expected):
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ValueError("Invalid slab archive record fields")
+
+
+def _invalid_json_constant(value):
+    raise ValueError(f"Nonfinite JSON value in slab archive: {value}")
+
+
+def _unique_json_fields(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"Repeated JSON key in slab archive: {key}")
+        result[key] = value
+    return result
+
+
+def _slab_object_hook(value):
+    if "__ndarray__" in value:
+        shape, dtype, data = value["__ndarray__"]
+        if (not isinstance(shape, list) or any(type(n) is not int or n < 0 for n in shape)
+                or not isinstance(data, list) or np.dtype(dtype).kind not in "biufcU"):
+            raise ValueError("Invalid slab archive array encoding")
+        size = 1
+        for n in shape:
+            size *= n
+        if len(data) != size * (2 if np.dtype(dtype).kind == "c" else 1):
+            raise ValueError("Slab archive array data does not match its shape")
+    decoded = ase_object_hook(value)
+    if "__ndarray__" in value:
+        encoded = json.dumps(decoded, default=_slab_json_default, allow_nan=False, sort_keys=True)
+        if encoded != json.dumps(value, allow_nan=False, sort_keys=True):
+            raise ValueError("Slab archive array decoding would change its data")
+    return decoded
+
+
+def _slab_json_default(value):
+    # ASE 3.22 lacks floating-scalar support and emits undecodable Unicode dtype names.
+    if isinstance(value, np.floating):
+        return float(value)
+    encoded = ASEJSONEncoder().default(value)
+    if isinstance(value, np.ndarray):
+        shape, _, data = encoded["__ndarray__"]
+        encoded["__ndarray__"] = (shape, str(value.dtype), data)
+    return encoded

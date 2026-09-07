@@ -1,7 +1,7 @@
 # 2D search foundations
 
 These opt-in helpers cover geometry, fingerprints, generation, atomic relaxation,
-structural validation, and an in-memory archive for a future 2D search mode.
+structural validation, and a persistent archive for a future 2D search mode.
 They do **not** enable 2D searches in `CRISPSearch`. Existing bulk search behavior,
 imports, fingerprint code, relaxation, archives, and dependencies are unchanged.
 
@@ -334,12 +334,67 @@ propagate. Changing `config`, `cutoff`, `natx`, or `orbital` on the fingerprint
 calculator requires a new archive, so cached descriptors cannot be mixed.
 Treat exposed archive entries and cached arrays as read-only.
 
-This step provides an in-memory archive. `save`, `load`, `save_checkpoint`, and
-`load_checkpoint` raise `NotImplementedError` without writing or reading files;
-the bulk persistence format does not record the required slab contract. Slab
-checkpoint compatibility is the next separate step. Bulk archives and
-`CRISPSearch` remain unchanged.
+Bulk archives and `CRISPSearch` remain unchanged.
 
 Run `python -m unittest discover -s tests -p test_slab_archive.py -v`.
 Guard tests use the base dependencies; real descriptor tests require the
 `torch_fplib` preflight and source checkout documented above.
+
+## Slab archive save/load
+
+`SlabArchive.save(path)` writes a **single JSON file**. Construct a destination
+archive with the same settings, then call `load(path)` to replace its entries:
+
+```python
+archive.save("slab-archive.json")
+restored = SlabArchive(
+    SlabFingerprintCalculator(config, cutoff=3.2, natx=32), {"Cu": 1},
+    min_dist_ang=1.5, bond_scale=1.2,
+)
+restored.load("slab-archive.json")
+best = restored.get_best(1)[0]
+```
+
+Format `crisp-slab-archive`, version 1, records the full `SlabConfig`, exact
+composition, fingerprint cutoff/capacity/orbital, distance and bond cutoffs,
+and both duplicate thresholds. All must match the destination archive;
+loading does not replace its configuration. Missing fields, unknown versions,
+bulk archive files, and incompatible settings are rejected.
+
+Records preserve insertion order, energies in eV/atom, generation tags,
+metadata, and ASE structures: cell, positions, atomic numbers, physical PBC,
+ordinary per-atom arrays, constraints, cell display displacement, and `Atoms.info`.
+Stored enthalpy and pressure are derived as energy and zero. Calculators and
+cached fingerprints are omitted. Loading recomputes descriptors through `add`,
+including geometry, connectivity, image-clearance, and composition validation.
+A duplicate record is an error, so a load cannot silently discard entries.
+
+Metadata and `Atoms.info` support finite JSON values: string-keyed dictionaries,
+lists, strings, numbers, booleans, and `None`; tuples become lists. Convert
+NumPy containers/scalars to ordinary Python values before saving metadata.
+Unsupported objects and object/structured/time atom arrays raise rather than
+being converted to strings. Numeric-looking and ASE-reserved metadata keys retain
+their literal meaning. Additional numeric, boolean, and Unicode per-atom arrays
+retain their dtype; ASE constraints must support ASE's dictionary serialization.
+
+Saving serializes before touching the destination, then writes a temporary file
+beside it and atomically replaces it. Serialization or write failure preserves
+the previous file and removes the temporary file. Loading builds a separate
+archive first: a malformed or invalid record, duplicate, or backend error leaves
+the destination's existing entries intact. Empty archives also round-trip.
+
+Keep archive entries and validation/duplicate settings unchanged while populated.
+Saving trusts those read-only entries and performs no fingerprint or energy
+calculations; loading revalidates them. Manually edited entries or changed
+thresholds can therefore make a saved file fail validation on reload. Use the
+same fingerprint backend/dependency versions for reproducible descriptors and
+the same physical energy model when adding further structures. The file records
+settings, not the calculator or a complete software environment.
+
+`save_checkpoint` and `load_checkpoint` still raise `NotImplementedError`:
+this PR restores archive contents, not search progress, GP state, or random-number
+state. The next step is a bounded local driver connecting generation, quench,
+validation, and archive insertion into a first automated 2D search.
+
+Run `python -m unittest discover -s tests -p 'test_slab_archive*.py' -v`.
+The archive tests pass with ASE 3.22.1 and 3.29.0, including real `s`/`sp` round trips.
